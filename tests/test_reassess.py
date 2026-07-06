@@ -1,10 +1,9 @@
 import unittest
 from unittest.mock import patch
 
-from bot import reassess_opportunities
 from arbitrage_bot.detector import ArbitrageDetector
 from arbitrage_bot.models import OpportunityRecord, ScanResult
-from arbitrage_bot.scanner import ArbitrageScanner
+from arbitrage_bot.runtime import reassess_opportunities
 
 
 class FakeScanner:
@@ -18,7 +17,7 @@ class FakeScanner:
 
 
 class ReassessOpportunitiesTest(unittest.TestCase):
-    @patch("bot.OpportunityMonitor.wait")
+    @patch("arbitrage_bot.clients.time.sleep")
     def test_marks_persisted_when_recheck_is_at_least_as_good(self, _wait) -> None:
         original = OpportunityRecord(
             observed_at="2026-07-03T00:00:00+00:00",
@@ -59,7 +58,7 @@ class ReassessOpportunitiesTest(unittest.TestCase):
 
         self.assertEqual(updated[0].evaluation_status, "persisted")
 
-    @patch("bot.OpportunityMonitor.wait")
+    @patch("arbitrage_bot.clients.time.sleep")
     def test_marks_expired_when_recheck_disappears(self, _wait) -> None:
         original = OpportunityRecord(
             observed_at="2026-07-03T00:00:00+00:00",

@@ -10,8 +10,10 @@ A Python bot that watches **SOL ↔ ETH** opportunities between **Raydium** and 
   - `raydium -> jupiter`
   - `jupiter -> raydium`
 - Stores quotes and detected opportunities in SQLite
+- Emits human-readable alerts for profitable opportunities above a configurable threshold
+- Can write an HTML dashboard from stored opportunity history
 - Optionally rechecks a detected opportunity after a delay to learn whether it persisted or vanished
-- Prints a JSON summary to stdout for automation
+- Prints JSON summary to stdout for automation
 
 ## Important limitation
 
@@ -38,7 +40,19 @@ python3 bot.py --once
 Run a repeated monitor loop:
 
 ```bash
-python3 bot.py --interval 20
+python3 bot.py --interval 20 --alert-min-bps 50
+```
+
+Generate a dashboard from each run:
+
+```bash
+python3 bot.py --once --dashboard-output reports/dashboard.html
+```
+
+Run the cron-friendly monitor helper used for background alerts:
+
+```bash
+python3 scripts/cron_monitor.py
 ```
 
 ## CLI options
@@ -56,6 +70,8 @@ Key flags:
 - `--db-path <path>` : SQLite location
 - `--monitor-seconds <int>` : wait and recheck profitable opportunities
 - `--jupiter-exclude-raydium` : compare Jupiter excluding Raydium liquidity
+- `--alert-min-bps <float>` : only emit alerts at or above this threshold
+- `--dashboard-output <path>` : write an HTML dashboard after each run
 
 ## Data files
 
@@ -79,3 +95,12 @@ This gives you a base for later improvements like:
 - filtering by profit persistence
 - tracking execution-size sensitivity
 - adding alert thresholds or dashboards
+
+## Always-on setup used here
+
+- Cron refreshes the monitor every minute using `scripts/cron_monitor.py`
+- The cron script updates:
+  - `reports/dashboard.html`
+  - `reports/latest_scan.json`
+- Discord alerts are emitted only when profitable opportunities meet the alert threshold
+- A local HTTP server can expose `reports/dashboard.html` on your LAN
