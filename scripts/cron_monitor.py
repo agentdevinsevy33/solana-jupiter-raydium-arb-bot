@@ -14,11 +14,26 @@ from bot import run_once  # noqa: E402
 
 def main() -> int:
     args = argparse.Namespace(
+        once=True,
+        interval=0,
         amount_sol=0.1,
+        amount=0.1,
+        amount_units="base",
+        base_symbol="SOL",
+        quote_symbol="USDC",
+        base_mint=None,
+        quote_mint=None,
+        base_decimals=None,
+        quote_decimals=None,
+        left_venue="raydium",
+        right_venue="jupiter",
+        slippage_bps=50,
         min_profit_bps=5.0,
         db_path=str(ROOT / "data" / "arbitrage.db"),
         monitor_seconds=15,
-        jupiter_exclude_raydium=True,
+        jupiter_exclude_raydium=False,
+        jupiter_dexes="",
+        jupiter_exclude_dexes="",
         alert_min_bps=25.0,
         dashboard_output=str(ROOT / "reports" / "dashboard.html"),
     )

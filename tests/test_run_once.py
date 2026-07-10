@@ -24,12 +24,23 @@ class FakeDetector:
 class FakeScanner:
     def __init__(self):
         self.detector = FakeDetector()
+        self.base_symbol = "SOL"
+        self.quote_symbol = "USDC"
+        self.start_amount = 100
+        self.slippage_bps = 50
+
+        class Client:
+            def __init__(self, venue):
+                self.venue = venue
+
+        self.left_client = Client("raydium")
+        self.right_client = Client("jupiter")
 
     def scan_once(self):
         quote = QuoteSnapshot(
             venue="raydium",
             input_mint="SOL",
-            output_mint="ETH",
+            output_mint="USDC",
             in_amount=100,
             out_amount=70,
             price_impact_pct=0.01,
@@ -40,7 +51,7 @@ class FakeScanner:
         opportunity = OpportunityRecord(
             observed_at="2026-07-03T00:00:00+00:00",
             base_symbol="SOL",
-            quote_symbol="ETH",
+            quote_symbol="USDC",
             direction="raydium_to_jupiter",
             start_amount=100,
             intermediate_amount=70,
@@ -74,7 +85,10 @@ class RunOnceDashboardTest(unittest.TestCase):
 
             self.assertEqual(len(result["alerts"]), 1)
             self.assertTrue(Path(result["dashboard_path"]).exists())
-            self.assertIn("SOL/ETH Arbitrage Dashboard", Path(result["dashboard_path"]).read_text())
+            html = Path(result["dashboard_path"]).read_text()
+            self.assertIn("SOL/USDC Arbitrage Dashboard", html)
+            self.assertIn("System Health", html)
+            self.assertIn("Scan status", html)
 
 
 if __name__ == "__main__":

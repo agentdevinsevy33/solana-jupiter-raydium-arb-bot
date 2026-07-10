@@ -10,6 +10,10 @@ class QuoteRequest:
     output_mint: str
     amount: int
     slippage_bps: int = 50
+    input_symbol: str = ""
+    output_symbol: str = ""
+    input_decimals: int = 0
+    output_decimals: int = 0
 
 
 @dataclass(slots=True)

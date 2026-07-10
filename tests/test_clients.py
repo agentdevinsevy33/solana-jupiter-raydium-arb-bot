@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from arbitrage_bot.clients import JupiterQuoteClient, OpportunityMonitor, RaydiumQuoteClient
+from arbitrage_bot.clients import JupiterQuoteClient, OpportunityMonitor, OrcaQuoteClient, RaydiumQuoteClient
 from arbitrage_bot.models import QuoteRequest, QuoteSnapshot
 
 
@@ -71,6 +71,49 @@ class QuoteClientsTest(unittest.TestCase):
 
         self.assertEqual(quote.route_labels, ["pool-1"])
         self.assertEqual(quote.out_amount, 7)
+
+    def test_orca_quote_client_uses_search_endpoint_and_best_pool(self) -> None:
+        session = FakeSession(
+            {
+                "data": [
+                    {
+                        "address": "pool-1",
+                        "tokenA": {"mint": "SOL", "symbol": "SOL"},
+                        "tokenB": {"mint": "USDC", "symbol": "USDC"},
+                        "price": 150.0,
+                        "liquidity": 2000000,
+                        "feeRate": 0.003,
+                    },
+                    {
+                        "address": "pool-2",
+                        "tokenA": {"mint": "SOL", "symbol": "SOL"},
+                        "tokenB": {"mint": "USDC", "symbol": "USDC"},
+                        "price": 149.0,
+                        "liquidity": 1000000,
+                        "feeRate": 0.003,
+                    },
+                ]
+            }
+        )
+        client = OrcaQuoteClient(session=session)
+
+        quote = client.get_quote(
+            QuoteRequest(
+                input_mint="SOL",
+                output_mint="USDC",
+                amount=100_000_000,
+                input_symbol="SOL",
+                output_symbol="USDC",
+                input_decimals=9,
+                output_decimals=6,
+            )
+        )
+
+        self.assertEqual(session.last_url, "https://api.orca.so/v2/solana/pools/search")
+        self.assertEqual(session.last_params["q"], "SOL-USDC")
+        self.assertEqual(quote.route_labels, ["pool-1"])
+        self.assertEqual(quote.output_mint, "USDC")
+        self.assertGreater(quote.out_amount, 0)
 
     @patch("arbitrage_bot.clients.time.sleep")
     def test_monitor_marks_expired_when_quote_deteriorates(self, _sleep) -> None:

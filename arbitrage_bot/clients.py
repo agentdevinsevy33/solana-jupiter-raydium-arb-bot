@@ -69,6 +69,7 @@ class JupiterQuoteClient(BaseHttpQuoteClient):
                 "context_slot": payload.get("contextSlot"),
                 "time_taken": payload.get("timeTaken"),
                 "swap_usd_value": payload.get("swapUsdValue"),
+                "raw_quote_response": payload,
             },
         )
 
@@ -104,6 +105,67 @@ class RaydiumQuoteClient(BaseHttpQuoteClient):
             metadata={
                 "id": payload.get("id"),
                 "version": payload.get("version"),
+                "raw_quote_response": payload,
+            },
+        )
+
+
+class OrcaQuoteClient(BaseHttpQuoteClient):
+    venue = "orca"
+
+    def get_quote(self, request: QuoteRequest) -> QuoteSnapshot:
+        if not request.input_symbol or not request.output_symbol:
+            raise QuoteClientError("Orca quotes require token symbols for pool discovery")
+        if request.input_decimals <= 0 or request.output_decimals <= 0:
+            raise QuoteClientError("Orca quotes require token decimals for amount conversion")
+
+        pair = f"{request.input_symbol}-{request.output_symbol}"
+        payload = self._get_json(
+            "https://api.orca.so/v2/solana/pools/search",
+            {"q": pair},
+        )
+        pools = payload.get("data") or []
+        if not pools:
+            raise QuoteClientError(f"No Orca pools found for {pair}")
+
+        matching = [
+            pool
+            for pool in pools
+            if {
+                pool.get("tokenA", {}).get("mint"),
+                pool.get("tokenB", {}).get("mint"),
+            }
+            == {request.input_mint, request.output_mint}
+        ]
+        candidates = matching or pools
+        best_pool = max(candidates, key=lambda pool: float(pool.get("liquidity") or 0.0))
+        price = float(best_pool.get("price") or 0.0)
+        if price <= 0:
+            raise QuoteClientError(f"Orca pool missing usable price for {pair}: {best_pool}")
+
+        fee_rate = float(best_pool.get("feeRate") or 0.0)
+        scale = 10 ** (request.output_decimals - request.input_decimals)
+        if best_pool.get("tokenA", {}).get("mint") == request.input_mint:
+            gross_out = request.amount * price * scale
+        else:
+            gross_out = request.amount / price * scale
+        out_amount = max(int(gross_out * (1 - fee_rate)), 1)
+
+        return QuoteSnapshot(
+            venue=self.venue,
+            input_mint=request.input_mint,
+            output_mint=request.output_mint,
+            in_amount=request.amount,
+            out_amount=out_amount,
+            price_impact_pct=0.0,
+            route_labels=[best_pool.get("address", pair)],
+            fetched_at=datetime.now(timezone.utc).isoformat(),
+            metadata={
+                "pair": pair,
+                "pool": best_pool.get("address"),
+                "price": price,
+                "liquidity": best_pool.get("liquidity"),
+                "fee_rate": fee_rate,
             },
         )
 

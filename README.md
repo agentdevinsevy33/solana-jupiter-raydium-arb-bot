@@ -1,34 +1,34 @@
-# Solana Jupiter/Raydium Arbitrage Monitor
+# Solana Arbitrage Monitor
 
-A Python bot that watches **SOL ↔ ETH** opportunities between **Raydium** and **Jupiter** on Solana, records quote history to SQLite, and produces a simple learning summary so the monitor can improve over time.
+A Python bot that watches configurable Solana token pairs across **Raydium**, **Jupiter**, and **Orca**, records quote history to SQLite, and produces lightweight analytics so you can iterate toward a better arbitrage search configuration.
 
 ## What this bot does
 
 - Pulls direct venue quotes from **Raydium**
-- Pulls comparison quotes from **Jupiter**
-- Checks both cycle directions:
-  - `raydium -> jupiter`
-  - `jupiter -> raydium`
+- Pulls routed comparison quotes from **Jupiter**
+- Pulls pool-based comparison quotes from **Orca**
+- Checks both cycle directions for any selected venue pair
 - Stores quotes and detected opportunities in SQLite
 - Emits human-readable alerts for profitable opportunities above a configurable threshold
 - Can write an HTML dashboard from stored opportunity history
+- Can sweep multiple pairs / venue combinations / sizes via an experiment runner
 - Optionally rechecks a detected opportunity after a delay to learn whether it persisted or vanished
 - Prints JSON summary to stdout for automation
 
 ## Important limitation
 
-This is a **monitoring / research bot**, not an auto-trading executor. It does **not** submit transactions or manage private keys. That is intentional for safety while you learn the market behavior.
+This is a **monitoring / research bot**, not an auto-trading executor. It does **not** submit transactions or manage private keys.
 
-## Pair configuration used now
+## Built-in token defaults
 
-- SOL mint: `So11111111111111111111111111111111111111112`
-- ETH mint used here: `2FPyTwcZLUg1MDrwsyoP4D6s1tM7hAkHYRjkNb5w6Pxk`
-  - Symbol on Raydium token list: `ETH`
-  - Name: `Wrapped Ethereum (Sollet)`
-- Also documented in `arbitrage_bot/token_config.py`:
-  - `wormhole_weth`: `7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs`
+Defined in `arbitrage_bot/token_config.py`:
 
-During live testing in this session, Jupiter returned `TOKEN_NOT_TRADABLE` for the Wormhole WETH mint, so the bot currently defaults to the tradable Sollet ETH mint.
+- `SOL`: `So11111111111111111111111111111111111111112` (9 decimals)
+- `ETH`: `2FPyTwcZLUg1MDrwsyoP4D6s1tM7hAkHYRjkNb5w6Pxk` (6 decimals)
+- `USDC`: `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v` (6 decimals)
+- `USDT`: `Es9vMFrzaCERmJfrF4H2FYD4uJ8V4aHcRUW2YCiMzFx` (6 decimals)
+
+You can override mint/decimals from the CLI for other tokens.
 
 ## Quick start
 
@@ -37,10 +37,22 @@ cd /home/sevy33/solana-jupiter-raydium-arb-bot
 python3 bot.py --once
 ```
 
+Monitor a different pair and venue combination:
+
+```bash
+python3 bot.py --once \
+  --base-symbol SOL \
+  --quote-symbol USDC \
+  --left-venue orca \
+  --right-venue jupiter \
+  --amount 1 \
+  --slippage-bps 30
+```
+
 Run a repeated monitor loop:
 
 ```bash
-python3 bot.py --interval 20 --alert-min-bps 50
+python3 bot.py --interval 20 --base-symbol SOL --quote-symbol USDC --alert-min-bps 50
 ```
 
 Generate a dashboard from each run:
@@ -55,6 +67,12 @@ Run the cron-friendly monitor helper used for background alerts:
 python3 scripts/cron_monitor.py
 ```
 
+Run the experiment sweep matrix:
+
+```bash
+python3 scripts/run_experiments.py
+```
+
 ## CLI options
 
 ```bash
@@ -65,13 +83,36 @@ Key flags:
 
 - `--once` : run a single scan and exit
 - `--interval <seconds>` : poll continuously
-- `--amount-sol <float>` : input size in SOL
+- `--base-symbol <symbol>` / `--quote-symbol <symbol>` : select token pair
+- `--base-mint <mint>` / `--quote-mint <mint>` : override token mints
+- `--base-decimals <n>` / `--quote-decimals <n>` : override token decimals
+- `--amount <float>` : trade size in selected units
+- `--amount-units base|quote` : interpret `--amount` in base or quote token units
+- `--amount-sol <float>` : legacy shorthand for SOL-sized base trades
+- `--left-venue raydium|jupiter|orca` : left side venue
+- `--right-venue raydium|jupiter|orca` : right side venue
+- `--slippage-bps <int>` : slippage tolerance in basis points
 - `--min-profit-bps <float>` : minimum profit threshold to report
 - `--db-path <path>` : SQLite location
 - `--monitor-seconds <int>` : wait and recheck profitable opportunities
 - `--jupiter-exclude-raydium` : compare Jupiter excluding Raydium liquidity
+- `--jupiter-dexes <csv>` : Jupiter dex allowlist
+- `--jupiter-exclude-dexes <csv>` : Jupiter dex blocklist
 - `--alert-min-bps <float>` : only emit alerts at or above this threshold
 - `--dashboard-output <path>` : write an HTML dashboard after each run
+
+## Experiment outputs
+
+`python3 scripts/run_experiments.py` writes:
+
+- `reports/experiments/latest.json`
+- `reports/experiments/run_<timestamp>.json`
+
+Default sweep covers:
+
+- pairs: `SOL/USDC`, `SOL/USDT`, `USDC/USDT`, `SOL/ETH`
+- venue combos: `raydium/jupiter`, `orca/jupiter`, `raydium/orca`
+- sizes: `0.1`, `1.0`, `10.0` base units
 
 ## Data files
 
@@ -79,28 +120,23 @@ Default database path:
 
 - `./data/arbitrage.db`
 
-## Learning loop
+Common report outputs:
 
-The monitor keeps a history of opportunities and computes:
-
-- total observations
-- how many persisted on recheck
-- persistence rate
-- average profit in bps
-- best historical direction
-
-This gives you a base for later improvements like:
-
-- filtering by time of day
-- filtering by profit persistence
-- tracking execution-size sensitivity
-- adding alert thresholds or dashboards
+- `./reports/dashboard.html`
+- `./reports/latest_scan.json`
+- `./reports/experiments/latest.json`
 
 ## Always-on setup used here
 
 - Cron refreshes the monitor every minute using `scripts/cron_monitor.py`
+- The recommended production configuration from the first sweep is now:
+  - pair: `SOL/USDC`
+  - venues: `Raydium` vs `Jupiter`
+  - amount: `0.1 SOL`
+  - slippage: `50 bps`
+  - persistence recheck: `15s`
+  - Jupiter includes Raydium routes
 - The cron script updates:
   - `reports/dashboard.html`
   - `reports/latest_scan.json`
 - Discord alerts are emitted only when profitable opportunities meet the alert threshold
-- A local HTTP server can expose `reports/dashboard.html` on your LAN

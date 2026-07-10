@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 from typing import Any
 
 from arbitrage_bot.alerts import AlertFormatter, should_emit_alert
@@ -63,9 +64,42 @@ class BotRuntime:
             for record in opportunities
             if should_emit_alert(record, min_alert_bps=self.min_alert_bps)
         ]
+        left_venue = getattr(getattr(self.scanner, "left_client", None), "venue", "unknown")
+        right_venue = getattr(getattr(self.scanner, "right_client", None), "venue", "unknown")
+        pair_label = f"{getattr(self.scanner, 'base_symbol', 'BASE')}/{getattr(self.scanner, 'quote_symbol', 'QUOTE')}"
+        scan_status = "ok" if not scan.errors else "degraded"
+        self.storage.save_scan_summary(
+            scanned_at=scan.scanned_at,
+            quote_count=len(scan.quotes),
+            opportunity_count=len(opportunities),
+            alert_count=len(alerts),
+            error_count=len(scan.errors),
+            scan_status=scan_status,
+            pair_label=pair_label,
+            left_venue=left_venue,
+            right_venue=right_venue,
+        )
         return {
             "scan": scan.to_dict(),
             "saved_opportunities": [item.to_dict() for item in opportunities],
             "learning_summary": learning_summary,
             "alerts": alerts,
         }
+
+    def run_loop(
+        self,
+        *,
+        interval_seconds: int,
+        max_cycles: int | None = None,
+        monitor_seconds: int = 0,
+    ) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        cycles = 0
+        while max_cycles is None or cycles < max_cycles:
+            results.append(self.run_cycle(monitor_seconds=monitor_seconds))
+            cycles += 1
+            if max_cycles is not None and cycles >= max_cycles:
+                break
+            if interval_seconds > 0:
+                time.sleep(interval_seconds)
+        return results
