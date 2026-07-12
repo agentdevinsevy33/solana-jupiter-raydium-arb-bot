@@ -17,7 +17,7 @@ A Python bot that watches configurable Solana token pairs across **Raydium**, **
 
 ## Important limitation
 
-This is a **monitoring / research bot**, not an auto-trading executor. It does **not** submit transactions or manage private keys.
+This is a **monitoring / research bot** first. It can also **prepare swap transactions** and now includes an **explicit execute-swaps mode** that signs and submits prepared transactions when given a wallet and RPC URL. Use live execution carefully.
 
 ## Built-in token defaults
 
@@ -31,6 +31,14 @@ Defined in `arbitrage_bot/token_config.py`:
 You can override mint/decimals from the CLI for other tokens.
 
 ## Quick start
+
+Install runtime dependencies:
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
+Then run a scan:
 
 ```bash
 cd /home/sevy33/solana-jupiter-raydium-arb-bot
@@ -59,6 +67,25 @@ Generate a dashboard from each run:
 
 ```bash
 python3 bot.py --once --dashboard-output reports/dashboard.html
+```
+
+Prepare unsigned swaps for review:
+
+```bash
+python3 bot.py --once \
+  --mode prepare-swaps \
+  --wallet-path wallets/devnet.json \
+  --network devnet
+```
+
+Execute prepared swaps through a specific RPC:
+
+```bash
+python3 bot.py --once \
+  --mode execute-swaps \
+  --wallet-path wallets/mainnet.json \
+  --network mainnet-beta \
+  --rpc-url https://your-solana-rpc.example
 ```
 
 Run the cron-friendly monitor helper used for background alerts:
@@ -100,6 +127,15 @@ Key flags:
 - `--jupiter-exclude-dexes <csv>` : Jupiter dex blocklist
 - `--alert-min-bps <float>` : only emit alerts at or above this threshold
 - `--dashboard-output <path>` : write an HTML dashboard after each run
+- `--mode monitor|prepare-swaps|execute-swaps` : monitor only, prepare swaps, or sign/send prepared swaps
+- `--wallet-path <path>` : wallet JSON used for prepare/execute swap modes
+- `--network devnet|mainnet-beta` : cluster tag used with wallet metadata
+- `--rpc-url <url>` : Solana RPC endpoint required for `execute-swaps`
+- `--confirm-timeout-seconds <float>` : confirmation wait timeout in execute mode
+- `--poll-interval-seconds <float>` : polling interval while waiting for confirmation
+- `--skip-preflight` : skip Solana RPC preflight during send
+- `--commitment processed|confirmed|finalized` : required confirmation level in execute mode
+- `--max-send-retries <int>` : RPC send retries in execute mode
 
 ## Experiment outputs
 

@@ -15,6 +15,7 @@ from arbitrage_bot.clients import (
 from arbitrage_bot.dashboard import DashboardWriter
 from arbitrage_bot.detector import ArbitrageDetector
 from arbitrage_bot.execution import ExecutionPlanBuilder
+from arbitrage_bot.executor import TradeExecutor
 from arbitrage_bot.runtime import BotRuntime
 from arbitrage_bot.scanner import ArbitrageScanner
 from arbitrage_bot.token_config import resolve_token
@@ -51,9 +52,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--jupiter-exclude-dexes", default="", help="Comma-separated Jupiter dex blocklist")
     parser.add_argument("--alert-min-bps", type=float, default=0.0, help="Only emit alerts at or above this profit threshold")
     parser.add_argument("--dashboard-output", default="", help="Optional HTML dashboard output path")
-    parser.add_argument("--mode", choices=["monitor", "prepare-swaps"], default="monitor", help="Run as a pure monitor or also prepare unsigned swap transactions for review")
+    parser.add_argument("--mode", choices=["monitor", "prepare-swaps", "execute-swaps"], default="monitor", help="Run as a pure monitor, prepare unsigned swap transactions for review, or sign/send prepared swaps")
     parser.add_argument("--wallet-path", default="", help="Optional JSON wallet path for devnet/mainnet transaction preparation")
     parser.add_argument("--network", choices=["devnet", "mainnet-beta"], default="devnet", help="Target Solana cluster for wallet metadata and dry-run prep")
+    parser.add_argument("--rpc-url", default="", help="Solana RPC URL used for execute-swaps mode")
+    parser.add_argument("--confirm-timeout-seconds", type=float, default=30.0, help="How long execute-swaps waits for confirmation before failing")
+    parser.add_argument("--poll-interval-seconds", type=float, default=1.0, help="Polling interval used while waiting for transaction confirmation")
+    parser.add_argument("--skip-preflight", action="store_true", help="Skip Solana RPC preflight checks in execute-swaps mode")
+    parser.add_argument("--commitment", choices=["processed", "confirmed", "finalized"], default="confirmed", help="Commitment level required before execute-swaps considers a transaction settled")
+    parser.add_argument("--max-send-retries", type=int, default=3, help="Maximum RPC retries when broadcasting signed transactions")
     parser.add_argument("--max-cycles", type=int, default=0, help="Optional cap for loop iterations when running continuously")
     return parser.parse_args(argv)
 
@@ -249,12 +256,41 @@ def prepare_swap_execution(args: argparse.Namespace, result: dict, wallet: Solan
 
 
 def _augment_result_with_execution_preparation(args: argparse.Namespace, result: dict) -> dict:
-    if getattr(args, "mode", "monitor") != "prepare-swaps":
+    if getattr(args, "mode", "monitor") not in {"prepare-swaps", "execute-swaps"}:
         return result
     wallet = ensure_wallet(args)
     if wallet is None:
-        raise ValueError("--wallet-path is required when --mode prepare-swaps is used")
+        raise ValueError("--wallet-path is required when --mode prepare-swaps or --mode execute-swaps is used")
     result.update(prepare_swap_execution(args, result, wallet))
+    return result
+
+
+def execute_prepared_swaps(args: argparse.Namespace, result: dict, wallet: SolanaWallet) -> dict:
+    rpc_url = getattr(args, "rpc_url", "") or ""
+    if not rpc_url:
+        raise ValueError("--rpc-url is required when --mode execute-swaps is used")
+    executor = TradeExecutor(
+        rpc_url=rpc_url,
+        confirm_timeout_seconds=getattr(args, "confirm_timeout_seconds", 30.0),
+        poll_interval_seconds=getattr(args, "poll_interval_seconds", 1.0),
+        skip_preflight=getattr(args, "skip_preflight", False),
+        commitment=getattr(args, "commitment", "confirmed"),
+        max_retries=getattr(args, "max_send_retries", 3),
+    )
+    return executor.execute_prepared_swaps(wallet, result.get("prepared_swaps", []))
+
+
+def _augment_result_with_execution(args: argparse.Namespace, result: dict) -> dict:
+    mode = getattr(args, "mode", "monitor")
+    if mode not in {"prepare-swaps", "execute-swaps"}:
+        return result
+    wallet = ensure_wallet(args)
+    if wallet is None:
+        raise ValueError("--wallet-path is required when --mode prepare-swaps or --mode execute-swaps is used")
+    if "prepared_swaps" not in result:
+        result.update(prepare_swap_execution(args, result, wallet))
+    if mode == "execute-swaps":
+        result.update(execute_prepared_swaps(args, result, wallet))
     return result
 
 
@@ -263,7 +299,7 @@ def main() -> int:
     try:
         if args.once or args.interval <= 0:
             result = run_once(args)
-            result = _augment_result_with_execution_preparation(args, result)
+            result = _augment_result_with_execution(args, result)
             print(json.dumps(result, indent=2))
             return 0
 
@@ -279,7 +315,7 @@ def main() -> int:
             monitor_seconds=args.monitor_seconds,
         )
         for result in loop_results:
-            result = _augment_result_with_execution_preparation(args, result)
+            result = _augment_result_with_execution(args, result)
             print(json.dumps(result, indent=2))
             for alert in result.get("alerts", []):
                 print(f"ALERT: {alert}")
