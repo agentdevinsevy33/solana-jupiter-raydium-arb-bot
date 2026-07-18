@@ -5,3 +5,7 @@ data/
 reports/
 .hermes/
 wallets/
+public/
+dashboard.html
+monitor.log
+logs/

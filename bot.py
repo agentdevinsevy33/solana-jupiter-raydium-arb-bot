@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,7 +15,7 @@ from arbitrage_bot.clients import (
 )
 from arbitrage_bot.dashboard import DashboardWriter
 from arbitrage_bot.detector import ArbitrageDetector
-from arbitrage_bot.execution import ExecutionPlanBuilder
+from arbitrage_bot.execution import ExecutionPlanBuilder, ExecutionPlanError
 from arbitrage_bot.executor import TradeExecutor
 from arbitrage_bot.runtime import BotRuntime
 from arbitrage_bot.scanner import ArbitrageScanner
@@ -22,6 +23,9 @@ from arbitrage_bot.token_config import resolve_token
 from arbitrage_bot.wallet import SolanaWallet, create_devnet_wallet, load_wallet
 
 LAMPORTS_PER_SOL = 1_000_000_000
+SOL_MINT = "So11111111111111111111111111111111111111112"
+# Conservative per-transaction network fee estimate (Solana base fee = 5000 lamports/sig).
+NETWORK_FEE_LAMPORTS_PER_TX = 5_000
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -61,6 +65,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--skip-preflight", action="store_true", help="Skip Solana RPC preflight checks in execute-swaps mode")
     parser.add_argument("--commitment", choices=["processed", "confirmed", "finalized"], default="confirmed", help="Commitment level required before execute-swaps considers a transaction settled")
     parser.add_argument("--max-send-retries", type=int, default=3, help="Maximum RPC retries when broadcasting signed transactions")
+    parser.add_argument(
+        "--execute-min-profit-bps",
+        type=float,
+        default=10.0,
+        help="Minimum NET profit (after fees) in bps required before the executor will act on a detected opportunity",
+    )
+    parser.add_argument(
+        "--priority-fee-lamports",
+        type=int,
+        default=20_000,
+        help="Fixed per-transaction Solana priority fee in lamports for execute-swaps (kept small; execution only fires on net-profitable opportunities)",
+    )
+    parser.add_argument(
+        "--raydium-compute-unit-price-micro-lamports",
+        type=int,
+        default=50_000,
+        help="Raydium swap compute-unit price in micro-lamports",
+    )
+    parser.add_argument(
+        "--max-execute-opportunities",
+        type=int,
+        default=1,
+        help="Maximum number of opportunities the executor will act on per scan",
+    )
+    parser.add_argument(
+        "--execute-slippage-buffer",
+        type=float,
+        default=0.01,
+        help="Fraction to reduce the reverse-leg input by to stay safe against forward-leg slippage",
+    )
     parser.add_argument("--max-cycles", type=int, default=0, help="Optional cap for loop iterations when running continuously")
     return parser.parse_args(argv)
 
@@ -186,72 +220,224 @@ def ensure_wallet(args: argparse.Namespace) -> SolanaWallet | None:
     return create_devnet_wallet(path, network=network)
 
 
-def prepare_swap_execution(args: argparse.Namespace, result: dict, wallet: SolanaWallet) -> dict:
-    builder = ExecutionPlanBuilder()
-    quotes = result.get("scan", {}).get("quotes", [])
-    plans: list[dict] = []
-    seen_venues: set[str] = set()
-    quotes_by_venue_and_input = {
-        (quote.get("venue", ""), quote.get("input_mint", "")): quote for quote in quotes
+def _reconstruct_quote_response(quote: dict, slippage_bps: int = 50) -> dict:
+    """Fallback quote-response payload when metadata.raw_quote_response is missing."""
+    venue = quote.get("venue")
+    if venue == "jupiter":
+        return {
+            "inputMint": quote["input_mint"],
+            "inAmount": str(quote["in_amount"]),
+            "outputMint": quote["output_mint"],
+            "outAmount": str(quote["out_amount"]),
+            "otherAmountThreshold": str(quote["out_amount"]),
+            "swapMode": "ExactIn",
+            "slippageBps": slippage_bps,
+            "priceImpactPct": str(quote.get("price_impact_pct", 0.0)),
+            "routePlan": [{"swapInfo": {"label": label}} for label in quote.get("route_labels", [])],
+        }
+    return {
+        "success": True,
+        "data": {
+            "swapType": "BaseIn",
+            "inputMint": quote["input_mint"],
+            "inputAmount": str(quote["in_amount"]),
+            "outputMint": quote["output_mint"],
+            "outputAmount": str(quote["out_amount"]),
+            "otherAmountThreshold": str(quote["out_amount"]),
+            "slippageBps": slippage_bps,
+            "priceImpactPct": quote.get("price_impact_pct", 0.0),
+            "referrerAmount": "0",
+            "routePlan": [
+                {
+                    "poolId": label,
+                    "inputMint": quote["input_mint"],
+                    "outputMint": quote["output_mint"],
+                    "feeAmount": "0",
+                    "feeMint": quote["input_mint"],
+                }
+                for label in quote.get("route_labels", [])
+            ],
+        },
     }
 
-    base_mint = quotes[0].get("input_mint") if quotes else ""
-    for venue in sorted({quote.get("venue") for quote in quotes if quote.get("venue") in {"jupiter", "raydium"}}):
-        if venue in seen_venues:
+
+def _buffer_quote_input(quote: dict, buffer: float) -> dict:
+    """Return a raw_quote_response copy with the input amount reduced by ``buffer``.
+    Used for the reverse leg so we never ask to swap more than the forward leg actually
+    returned (forward-leg slippage safety)."""
+    raw = dict(quote.get("metadata", {}).get("raw_quote_response") or _reconstruct_quote_response(quote))
+    factor = 1.0 - float(buffer)
+    if "inAmount" in raw:
+        raw["inAmount"] = str(int(int(raw["inAmount"]) * factor))
+    data = raw.get("data")
+    if isinstance(data, dict) and "inputAmount" in data:
+        data["inputAmount"] = str(int(int(data["inputAmount"]) * factor))
+    return raw
+
+
+def _build_swap_plan(
+    builder: ExecutionPlanBuilder,
+    venue: str,
+    quote: dict,
+    wallet: SolanaWallet,
+    *,
+    priority_fee_lamports: int,
+    raydium_cu_price: int,
+    in_mint: str,
+    out_mint: str,
+    slippage_bps: int,
+) -> "object":
+    raw = quote.get("metadata", {}).get("raw_quote_response") or _reconstruct_quote_response(quote, slippage_bps)
+    if venue == "jupiter":
+        return builder.build_jupiter_swap_plan(
+            public_key=wallet.public_key,
+            quote_response=raw,
+            priority_fee_lamports=priority_fee_lamports,
+        )
+    if venue == "raydium":
+        return builder.build_raydium_swap_plan(
+            public_key=wallet.public_key,
+            quote_response=raw,
+            wrap_sol=(in_mint == SOL_MINT),
+            unwrap_sol=(out_mint == SOL_MINT),
+            compute_unit_price_micro_lamports=raydium_cu_price,
+        )
+    raise ExecutionPlanError(f"Execution is not supported for venue '{venue}' (only jupiter and raydium are executable)")
+
+
+def estimate_net_profit_bps(
+    opp: dict, *, priority_fee_lamports: int, network_fee_lamports: int = NETWORK_FEE_LAMPORTS_PER_TX
+) -> float:
+    """Gross opportunity profit minus estimated round-trip transaction fees, in bps."""
+    start = opp.get("start_amount") or 0
+    gross_bps = opp.get("profit_bps", 0.0)
+    # Round trip = 2 swaps: network fee + priority fee on each.
+    fee_lamports = 2 * (network_fee_lamports + priority_fee_lamports)
+    fee_bps = (fee_lamports / start) * 10_000 if start else 0.0
+    return gross_bps - fee_bps
+
+
+def prepare_swap_execution(args: argparse.Namespace, result: dict, wallet: SolanaWallet) -> dict:
+    """Build swap plans for arbitrage execution, GATED on detected profitable opportunities.
+
+    Critical safety properties (vs. the old implementation which blindly sold SOL):
+    - Only acts when ``scan.opportunities`` contains a qualifying opportunity.
+    - Each plan is a full round trip: buy base->quote on the buy venue, then sell
+      quote->base on the sell venue (the actual arbitrage cycle).
+    - Requires the opportunity to be NET-profitable after estimated fees.
+    - If nothing qualifies, returns an empty ``prepared_swaps`` list so the executor
+      broadcasts nothing.
+    """
+    scan = result.get("scan", {})
+    quotes = scan.get("quotes", [])
+    opportunities = scan.get("opportunities", [])
+    if not quotes:
+        return {"wallet": wallet.to_public_dict(), "prepared_swaps": [], "execution_skipped": "no_quotes"}
+    if not opportunities:
+        return {"wallet": wallet.to_public_dict(), "prepared_swaps": [], "execution_skipped": "no_opportunities"}
+
+    quotes_by_venue_input = {(q["venue"], q["input_mint"]): q for q in quotes}
+    base_mint = quotes[0]["input_mint"]
+    quote_mint = quotes[0]["output_mint"]
+    execute_min_profit_bps = float(getattr(args, "execute_min_profit_bps", 10.0))
+    priority_fee_lamports = int(getattr(args, "priority_fee_lamports", 20_000))
+    raydium_cu_price = int(getattr(args, "raydium_compute_unit_price_micro_lamports", 50_000))
+    max_opps = int(getattr(args, "max_execute_opportunities", 1))
+    slippage_buffer = float(getattr(args, "execute_slippage_buffer", 0.01))
+    slippage_bps = int(getattr(args, "slippage_bps", 50))
+
+    builder = ExecutionPlanBuilder()
+    plans: list[dict] = []
+    skipped: list[dict] = []
+
+    for opp in opportunities:
+        if len(plans) >= max_opps:
+            break
+        gross_bps = opp.get("profit_bps", 0.0)
+        if gross_bps < execute_min_profit_bps:
+            skipped.append({"direction": opp.get("direction"), "reason": "below_gross_threshold", "gross_profit_bps": gross_bps})
             continue
-        forward_quote = quotes_by_venue_and_input.get((venue, base_mint))
-        if forward_quote is None:
+        net_bps = estimate_net_profit_bps(opp, priority_fee_lamports=priority_fee_lamports)
+        if net_bps < execute_min_profit_bps:
+            skipped.append(
+                {
+                    "direction": opp.get("direction"),
+                    "reason": "below_net_threshold_after_fees",
+                    "gross_profit_bps": gross_bps,
+                    "est_net_profit_bps": net_bps,
+                }
+            )
             continue
-        if venue == "jupiter":
-            quote_response = forward_quote.get("metadata", {}).get("raw_quote_response") or {
-                "inputMint": forward_quote["input_mint"],
-                "inAmount": str(forward_quote["in_amount"]),
-                "outputMint": forward_quote["output_mint"],
-                "outAmount": str(forward_quote["out_amount"]),
-                "otherAmountThreshold": str(forward_quote["out_amount"]),
-                "swapMode": "ExactIn",
-                "slippageBps": getattr(args, "slippage_bps", 50),
-                "priceImpactPct": str(forward_quote.get("price_impact_pct", 0.0)),
-                "routePlan": [{"swapInfo": {"label": label}} for label in forward_quote.get("route_labels", [])],
-            }
-            plan = builder.build_jupiter_swap_plan(public_key=wallet.public_key, quote_response=quote_response)
-        else:
-            quote_response = forward_quote.get("metadata", {}).get("raw_quote_response") or {
-                "success": True,
-                "data": {
-                    "swapType": "BaseIn",
-                    "inputMint": forward_quote["input_mint"],
-                    "inputAmount": str(forward_quote["in_amount"]),
-                    "outputMint": forward_quote["output_mint"],
-                    "outputAmount": str(forward_quote["out_amount"]),
-                    "otherAmountThreshold": str(forward_quote["out_amount"]),
-                    "slippageBps": getattr(args, "slippage_bps", 50),
-                    "priceImpactPct": forward_quote.get("price_impact_pct", 0.0),
-                    "referrerAmount": "0",
-                    "routePlan": [
-                        {
-                            "poolId": label,
-                            "inputMint": forward_quote["input_mint"],
-                            "outputMint": forward_quote["output_mint"],
-                            "feeAmount": "0",
-                            "feeMint": forward_quote["input_mint"],
-                        }
-                        for label in forward_quote.get("route_labels", [])
-                    ],
+        buy_venue = opp.get("buy_venue")
+        sell_venue = opp.get("sell_venue")
+        buy_quote = quotes_by_venue_input.get((buy_venue, base_mint))
+        sell_quote = quotes_by_venue_input.get((sell_venue, quote_mint))
+        if not buy_quote or not sell_quote:
+            skipped.append(
+                {
+                    "direction": opp.get("direction"),
+                    "reason": "missing_quote_for_leg",
+                    "buy_venue": buy_venue,
+                    "sell_venue": sell_venue,
+                }
+            )
+            continue
+        try:
+            leg1 = _build_swap_plan(
+                builder,
+                buy_venue,
+                buy_quote,
+                wallet,
+                priority_fee_lamports=priority_fee_lamports,
+                raydium_cu_price=raydium_cu_price,
+                in_mint=base_mint,
+                out_mint=quote_mint,
+                slippage_bps=slippage_bps,
+            )
+            sell_quote_buffered = dict(sell_quote)
+            sell_quote_buffered["metadata"] = dict(sell_quote.get("metadata", {}))
+            sell_quote_buffered["metadata"]["raw_quote_response"] = _buffer_quote_input(sell_quote, slippage_buffer)
+            leg2 = _build_swap_plan(
+                builder,
+                sell_venue,
+                sell_quote_buffered,
+                wallet,
+                priority_fee_lamports=priority_fee_lamports,
+                raydium_cu_price=raydium_cu_price,
+                in_mint=quote_mint,
+                out_mint=base_mint,
+                slippage_bps=slippage_bps,
+            )
+        except (ExecutionPlanError, Exception) as exc:  # noqa: BLE001 - skip this opp, never abort the run
+            skipped.append({"direction": opp.get("direction"), "reason": "plan_build_failed", "error": str(exc)})
+            continue
+
+        plans.append(
+            {
+                "venue": f"{buy_venue}_to_{sell_venue}",
+                "public_key": wallet.public_key,
+                "transactions_base64": leg1.transactions_base64 + leg2.transactions_base64,
+                "transaction_count": leg1.transaction_count + leg2.transaction_count,
+                "metadata": {
+                    "direction": opp.get("direction"),
+                    "buy_venue": buy_venue,
+                    "sell_venue": sell_venue,
+                    "start_amount": opp.get("start_amount"),
+                    "intermediate_amount": opp.get("intermediate_amount"),
+                    "end_amount": opp.get("end_amount"),
+                    "gross_profit_bps": gross_bps,
+                    "est_net_profit_bps": net_bps,
+                    "priority_fee_lamports": priority_fee_lamports,
+                    "legs": [leg1.metadata, leg2.metadata],
                 },
             }
-            plan = builder.build_raydium_swap_plan(
-                public_key=wallet.public_key,
-                quote_response=quote_response,
-                wrap_sol=forward_quote["input_mint"] == "So11111111111111111111111111111111111111112",
-                unwrap_sol=forward_quote["output_mint"] == "So11111111111111111111111111111111111111112",
-            )
-        plans.append(plan.to_dict())
-        seen_venues.add(venue)
+        )
 
     return {
         "wallet": wallet.to_public_dict(),
         "prepared_swaps": plans,
+        "execution_skipped": None if plans else "no_qualifying_opportunities",
+        "skipped_opportunities": skipped,
     }
 
 
@@ -303,22 +489,20 @@ def main() -> int:
             print(json.dumps(result, indent=2))
             return 0
 
-        scanner = build_scanner(args)
-        runtime = BotRuntime.from_components(
-            scanner=scanner,
-            db_path=Path(args.db_path),
-            min_alert_bps=args.alert_min_bps,
-        )
-        loop_results = runtime.run_loop(
-            interval_seconds=args.interval,
-            max_cycles=args.max_cycles if args.max_cycles > 0 else None,
-            monitor_seconds=args.monitor_seconds,
-        )
-        for result in loop_results:
+        # Continuous monitoring loop: run a full scan+prepare cycle on an
+        # interval. run_once() writes the live dashboard (with heartbeat) on
+        # every cycle, so the dashboard stays current while this process lives.
+        cycles = 0
+        while True:
+            result = run_once(args)
             result = _augment_result_with_execution(args, result)
             print(json.dumps(result, indent=2))
             for alert in result.get("alerts", []):
                 print(f"ALERT: {alert}")
+            cycles += 1
+            if args.max_cycles > 0 and cycles >= args.max_cycles:
+                break
+            time.sleep(args.interval)
         return 0
     except QuoteClientError as exc:
         print(json.dumps({"error": str(exc)}))

@@ -55,18 +55,18 @@ class ExecutionPlanBuilder:
         self._jupiter = _BaseExecutionClient(session=jupiter_session, timeout=timeout)
         self._raydium = _BaseExecutionClient(session=raydium_session, timeout=timeout)
 
-    def build_jupiter_swap_plan(self, *, public_key: str, quote_response: dict[str, Any]) -> ExecutionPlan:
+    def build_jupiter_swap_plan(
+        self, *, public_key: str, quote_response: dict[str, Any], priority_fee_lamports: int = 20_000
+    ) -> ExecutionPlan:
+        # NOTE: priority fee is a small FIXED lamport amount, not "veryHigh".
+        # At 0.1-0.25 SOL trade sizes a veryHigh/1_000_000-lamport fee (~100 bps per
+        # swap) guarantees a loss regardless of any arbitrage spread. Execution only
+        # fires when a detected opportunity is net-profitable after this fee.
         payload = {
             "userPublicKey": public_key,
             "quoteResponse": quote_response,
             "dynamicComputeUnitLimit": True,
-            "dynamicSlippage": True,
-            "prioritizationFeeLamports": {
-                "priorityLevelWithMaxLamports": {
-                    "priorityLevel": "veryHigh",
-                    "maxLamports": 1_000_000,
-                }
-            },
+            "prioritizationFeeLamports": int(priority_fee_lamports),
         }
         response = self._jupiter._post_json("https://api.jup.ag/swap/v1/swap", payload)
         transaction = response.get("swapTransaction")
