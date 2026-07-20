@@ -16,7 +16,7 @@ from arbitrage_bot.clients import (
 from arbitrage_bot.dashboard import DashboardWriter
 from arbitrage_bot.detector import ArbitrageDetector
 from arbitrage_bot.execution import ExecutionPlanBuilder, ExecutionPlanError
-from arbitrage_bot.executor import TradeExecutor
+from arbitrage_bot.executor import SolanaRpcClient, TradeExecutor
 from arbitrage_bot.runtime import BotRuntime
 from arbitrage_bot.scanner import ArbitrageScanner
 from arbitrage_bot.token_config import resolve_token
@@ -65,6 +65,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--skip-preflight", action="store_true", help="Skip Solana RPC preflight checks in execute-swaps mode")
     parser.add_argument("--commitment", choices=["processed", "confirmed", "finalized"], default="confirmed", help="Commitment level required before execute-swaps considers a transaction settled")
     parser.add_argument("--max-send-retries", type=int, default=3, help="Maximum RPC retries when broadcasting signed transactions")
+    parser.add_argument("--max-leg-retries", type=int, default=3, help="When a later leg of a round trip fails at broadcast (e.g. stale quote), retry it this many times with a freshly-fetched quote before giving up")
     parser.add_argument(
         "--execute-min-profit-bps",
         type=float,
@@ -295,12 +296,20 @@ def _build_swap_plan(
             priority_fee_lamports=priority_fee_lamports,
         )
     if venue == "raydium":
+        input_account = None
+        output_account = None
+        if in_mint != SOL_MINT:
+            input_account = _ata_address(wallet.public_key, in_mint)
+        if out_mint != SOL_MINT:
+            output_account = _ata_address(wallet.public_key, out_mint)
         return builder.build_raydium_swap_plan(
             public_key=wallet.public_key,
             quote_response=raw,
             wrap_sol=(in_mint == SOL_MINT),
             unwrap_sol=(out_mint == SOL_MINT),
             compute_unit_price_micro_lamports=raydium_cu_price,
+            input_account=input_account,
+            output_account=output_account,
         )
     raise ExecutionPlanError(f"Execution is not supported for venue '{venue}' (only jupiter and raydium are executable)")
 
@@ -428,7 +437,24 @@ def prepare_swap_execution(args: argparse.Namespace, result: dict, wallet: Solan
                     "gross_profit_bps": gross_bps,
                     "est_net_profit_bps": net_bps,
                     "priority_fee_lamports": priority_fee_lamports,
-                    "legs": [leg1.metadata, leg2.metadata],
+                    "legs": [
+                        {
+                            **leg1.metadata,
+                            "venue": buy_venue,
+                            "in_mint": base_mint,
+                            "out_mint": quote_mint,
+                            "amount": opp.get("start_amount"),
+                            "slippage_bps": slippage_bps,
+                        },
+                        {
+                            **leg2.metadata,
+                            "venue": sell_venue,
+                            "in_mint": quote_mint,
+                            "out_mint": base_mint,
+                            "amount": opp.get("intermediate_amount"),
+                            "slippage_bps": slippage_bps,
+                        },
+                    ],
                 },
             }
         )
@@ -455,6 +481,7 @@ def execute_prepared_swaps(args: argparse.Namespace, result: dict, wallet: Solan
     rpc_url = getattr(args, "rpc_url", "") or ""
     if not rpc_url:
         raise ValueError("--rpc-url is required when --mode execute-swaps is used")
+    rpc_client = SolanaRpcClient(rpc_url=rpc_url)
     executor = TradeExecutor(
         rpc_url=rpc_url,
         confirm_timeout_seconds=getattr(args, "confirm_timeout_seconds", 30.0),
@@ -462,8 +489,12 @@ def execute_prepared_swaps(args: argparse.Namespace, result: dict, wallet: Solan
         skip_preflight=getattr(args, "skip_preflight", False),
         commitment=getattr(args, "commitment", "confirmed"),
         max_retries=getattr(args, "max_send_retries", 3),
+        rebuild_leg=_make_rebuild_leg(args, wallet, rpc_client),
+        max_leg_retries=int(getattr(args, "max_leg_retries", 3)),
     )
-    return executor.execute_prepared_swaps(wallet, result.get("prepared_swaps", []))
+    out = executor.execute_prepared_swaps(wallet, result.get("prepared_swaps", []))
+    _recover_partial_plans(args, wallet, rpc_client, out)
+    return out
 
 
 def _augment_result_with_execution(args: argparse.Namespace, result: dict) -> dict:
@@ -478,6 +509,126 @@ def _augment_result_with_execution(args: argparse.Namespace, result: dict) -> di
     if mode == "execute-swaps":
         result.update(execute_prepared_swaps(args, result, wallet))
     return result
+
+
+# --- Round-trip resilience: fresh-quote retry + mid-route recovery ----------
+def _ata_address(owner: str, mint: str) -> str:
+    from solders.pubkey import Pubkey
+
+    ata_program = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
+    owner_p = Pubkey.from_string(owner)
+    mint_p = Pubkey.from_string(mint)
+    seeds = [b"associated", bytes(owner_p), bytes(mint_p)]
+    addr, _ = Pubkey.find_program_address(seeds, ata_program)
+    return str(addr)
+
+
+def _quote_client_for(venue: str) -> "object":
+    if venue == "jupiter":
+        return JupiterQuoteClient()
+    if venue == "raydium":
+        return RaydiumQuoteClient()
+    raise ExecutionPlanError(f"No quote client available for venue '{venue}'")
+
+
+def _actual_input_amount(rpc_client: "object", pubkey: str, mint: str, fallback: int) -> int:
+    """Actual balance of ``mint`` held by the wallet, used to re-quote a leg
+    against reality (handles partial fills / dust)."""
+    if mint == SOL_MINT:
+        lamports = rpc_client._rpc("getBalance", [pubkey])["value"]
+        rent_reserve = 5_000_000
+        return max(lamports - rent_reserve, 0)
+    ata = rpc_client._rpc("getTokenAccountsByOwner", [pubkey, {"mint": mint}, {"encoding": "jsonParsed"}])
+    values = (ata.get("value") or []) if isinstance(ata, dict) else []
+    if not values:
+        return int(fallback or 0)
+    return int(values[0]["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"])
+
+
+def _make_rebuild_leg(args: argparse.Namespace, wallet: SolanaWallet, rpc_client: "object"):
+    builder = ExecutionPlanBuilder()
+    priority_fee = int(getattr(args, "priority_fee_lamports", 20_000))
+    cu_price = int(getattr(args, "raydium_compute_unit_price_micro_lamports", 50_000))
+    slippage_bps = int(getattr(args, "slippage_bps", 50))
+
+    def rebuild_leg(plan: dict, index: int):
+        legs = (plan.get("metadata") or {}).get("legs") or [None, None]
+        leg_meta = legs[index] if index < len(legs) else None
+        if not leg_meta:
+            return None
+        in_mint = leg_meta["in_mint"]
+        out_mint = leg_meta["out_mint"]
+        amount = _actual_input_amount(rpc_client, wallet.public_key, in_mint, fallback=leg_meta.get("amount") or 0)
+        if amount <= 0:
+            return None
+        client = _quote_client_for(leg_meta["venue"])
+        quote = client.get_quote(
+            QuoteRequest(input_mint=in_mint, output_mint=out_mint, amount=amount, slippage_bps=slippage_bps)
+        )
+        return _build_swap_plan(
+            builder,
+            leg_meta["venue"],
+            quote,
+            wallet,
+            priority_fee_lamports=priority_fee,
+            raydium_cu_price=cu_price,
+            in_mint=in_mint,
+            out_mint=out_mint,
+            slippage_bps=slippage_bps,
+        )
+
+    return rebuild_leg
+
+
+def _reverse_partial_plan(args: argparse.Namespace, wallet: SolanaWallet, rpc_client: "object", plan_result: dict) -> None:
+    """Reverse a partially-executed round trip so the wallet is never left
+    holding an intermediate asset. The confirmed leg is the buy leg
+    (base->quote); we swap the quote asset back to base via the same venue."""
+    meta = plan_result.get("metadata", {})
+    legs = meta.get("legs") or []
+    if not legs:
+        return
+    buy_venue = meta.get("buy_venue")
+    base_mint = legs[0].get("in_mint")
+    quote_mint = legs[0].get("out_mint")
+    if not (buy_venue and base_mint and quote_mint):
+        return
+    amount = _actual_input_amount(rpc_client, wallet.public_key, quote_mint, fallback=0)
+    if amount <= 0:
+        return
+    client = _quote_client_for(buy_venue)
+    quote = client.get_quote(
+        QuoteRequest(input_mint=quote_mint, output_mint=base_mint, amount=amount, slippage_bps=int(getattr(args, "slippage_bps", 50)))
+    )
+    plan = _build_swap_plan(
+        ExecutionPlanBuilder(),
+        buy_venue,
+        quote,
+        wallet,
+        priority_fee_lamports=int(getattr(args, "priority_fee_lamports", 20_000)),
+        raydium_cu_price=int(getattr(args, "raydium_compute_unit_price_micro_lamports", 50_000)),
+        in_mint=quote_mint,
+        out_mint=base_mint,
+        slippage_bps=int(getattr(args, "slippage_bps", 50)),
+    )
+    recovery_executor = TradeExecutor(
+        rpc_url=getattr(args, "rpc_url", ""),
+        skip_preflight=False,
+        commitment=getattr(args, "commitment", "confirmed"),
+        max_retries=getattr(args, "max_send_retries", 3),
+    )
+    recovery_out = recovery_executor.execute_prepared_swaps(wallet, [plan.to_dict()])
+    print(json.dumps({"mid_route_recovery": {"buy_venue": buy_venue, "recovered_amount": amount, "result": recovery_out}}, indent=2))
+
+
+def _recover_partial_plans(args: argparse.Namespace, wallet: SolanaWallet, rpc_client: "object", exec_out: dict) -> None:
+    for item in exec_out.get("execution_results", []):
+        if item.get("partial"):
+            print(json.dumps({"warning": "partial round-trip execution detected; attempting midroute recovery", "venue": item.get("venue")}))
+            try:
+                _reverse_partial_plan(args, wallet, rpc_client, item)
+            except Exception as exc:  # noqa: BLE001 - recovery must never crash the run
+                print(json.dumps({"error": f"mid_route_recovery_failed: {exc}"}))
 
 
 def main() -> int:

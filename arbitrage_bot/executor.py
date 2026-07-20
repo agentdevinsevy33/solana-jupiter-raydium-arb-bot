@@ -101,6 +101,8 @@ class TradeExecutor:
         skip_preflight: bool = False,
         commitment: str = "confirmed",
         max_retries: int = 3,
+        rebuild_leg: Callable[[dict[str, Any], int], "object"] | None = None,
+        max_leg_retries: int = 3,
     ) -> None:
         self.rpc_client = SolanaRpcClient(rpc_url=rpc_url, session=session, timeout=timeout)
         self.confirm_timeout_seconds = confirm_timeout_seconds
@@ -108,6 +110,11 @@ class TradeExecutor:
         self.skip_preflight = skip_preflight
         self.commitment = commitment
         self.max_retries = max_retries
+        # Optional callback that re-derives a single leg (by index) from a fresh
+        # quote. Used to retry a later leg whose broadcast failed because its
+        # pre-built transaction went stale (e.g. Jupiter 0x1771).
+        self.rebuild_leg = rebuild_leg
+        self.max_leg_retries = max(0, int(max_leg_retries))
 
     def execute_prepared_swaps(self, wallet: SolanaWallet, prepared_swaps: list[dict[str, Any]]) -> dict[str, Any]:
         results: list[dict[str, Any]] = []
@@ -159,37 +166,67 @@ class TradeExecutor:
 
         tx_results: list[dict[str, Any]] = []
         for index, transaction_base64 in enumerate(transactions):
-            signed_transaction_base64, local_signature = self._sign_transaction_base64(wallet, transaction_base64)
-            send_started = time.monotonic()
-            rpc_signature = self.rpc_client.send_transaction(
-                signed_transaction_base64,
-                skip_preflight=self.skip_preflight,
-                preflight_commitment=self.commitment,
-                max_retries=self.max_retries,
-            )
-            send_latency_ms = round((time.monotonic() - send_started) * 1000, 3)
-            confirm_started = time.monotonic()
-            status = self._confirm_signature(rpc_signature)
-            confirm_latency_ms = round((time.monotonic() - confirm_started) * 1000, 3)
-            tx_results.append(
-                {
-                    "transaction_index": index,
-                    "local_signature": local_signature,
-                    "rpc_signature": rpc_signature,
-                    "send_latency_ms": send_latency_ms,
-                    "confirm_latency_ms": confirm_latency_ms,
-                    "slot": status.get("slot") if status else None,
-                    "confirmations": status.get("confirmations") if status else None,
-                    "confirmation_status": status.get("confirmationStatus") if status else None,
-                    "err": status.get("err") if status else None,
-                }
-            )
+            tx_to_send = transaction_base64
+            confirmed = False
+            last_exc: Exception | None = None
+            # Later legs can be re-derived from a fresh quote if they fail at
+            # broadcast/simulation (e.g. stale Jupiter quote -> 0x1771). The
+            # first leg is the entry point and is never re-derived.
+            can_retry = index > 0 and self.rebuild_leg is not None
+            for attempt in range(1 + (self.max_leg_retries if can_retry else 0)):
+                try:
+                    signed_transaction_base64, local_signature = self._sign_transaction_base64(wallet, tx_to_send)
+                    send_started = time.monotonic()
+                    rpc_signature = self.rpc_client.send_transaction(
+                        signed_transaction_base64,
+                        skip_preflight=self.skip_preflight,
+                        preflight_commitment=self.commitment,
+                        max_retries=self.max_retries,
+                    )
+                    send_latency_ms = round((time.monotonic() - send_started) * 1000, 3)
+                    confirm_started = time.monotonic()
+                    status = self._confirm_signature(rpc_signature)
+                    confirm_latency_ms = round((time.monotonic() - confirm_started) * 1000, 3)
+                    tx_results.append(
+                        {
+                            "transaction_index": index,
+                            "attempt": attempt,
+                            "local_signature": local_signature,
+                            "rpc_signature": rpc_signature,
+                            "send_latency_ms": send_latency_ms,
+                            "confirm_latency_ms": confirm_latency_ms,
+                            "slot": status.get("slot") if status else None,
+                            "confirmations": status.get("confirmations") if status else None,
+                            "confirmation_status": status.get("confirmationStatus") if status else None,
+                            "err": status.get("err") if status else None,
+                        }
+                    )
+                    confirmed = True
+                    break
+                except (ExecutorError, RpcResponseError) as exc:
+                    last_exc = exc
+                    if can_retry and attempt < self.max_leg_retries:
+                        fresh = self.rebuild_leg(plan, index)
+                        if fresh is not None and getattr(fresh, "transactions_base64", None):
+                            tx_to_send = fresh.transactions_base64[0]
+                            continue
+                    break
+            if not confirmed:
+                # Surface the failure so the caller records + stops the plan.
+                raise last_exc if last_exc else ExecutorError(f"Leg {index} failed to confirm")
 
+        confirmed_count = sum(
+            1
+            for tx in tx_results
+            if tx.get("confirmation_status") in {"processed", "confirmed", "finalized"} and tx.get("err") is None
+        )
         return {
             "venue": plan.get("venue", "unknown"),
             "public_key": plan.get("public_key", wallet.public_key),
             "transaction_count": len(tx_results),
-            "ok": True,
+            "confirmed_transaction_count": confirmed_count,
+            "partial": 0 < confirmed_count < len(transactions),
+            "ok": confirmed_count == len(transactions),
             "transactions": tx_results,
             "metadata": dict(plan.get("metadata") or {}),
         }

@@ -2,6 +2,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from solders.pubkey import Pubkey
+
 from bot import estimate_net_profit_bps, prepare_swap_execution
 
 SOL = "So11111111111111111111111111111111111111112"
@@ -25,7 +27,8 @@ class FakeBuilder:
         return FakePlan("jupiter", public_key, ["AQID"])
 
     def build_raydium_swap_plan(
-        self, *, public_key, quote_response, wrap_sol=False, unwrap_sol=False, compute_unit_price_micro_lamports=50_000
+        self, *, public_key, quote_response, wrap_sol=False, unwrap_sol=False,
+        compute_unit_price_micro_lamports=50_000, input_account=None, output_account=None,
     ):
         return FakePlan("raydium", public_key, ["AQID"])
 
@@ -90,8 +93,11 @@ def make_args(**overrides):
     return args
 
 
+VALID_PUBKEY = str(Pubkey.new_unique())
+
+
 def fake_wallet():
-    return SimpleNamespace(public_key="PubKey111", to_public_dict=lambda: {"public_key": "PubKey111"})
+    return SimpleNamespace(public_key=VALID_PUBKEY, to_public_dict=lambda: {"public_key": VALID_PUBKEY})
 
 
 @patch("bot.ExecutionPlanBuilder", FakeBuilder)
