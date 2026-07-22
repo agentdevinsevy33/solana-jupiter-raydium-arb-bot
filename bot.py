@@ -19,6 +19,7 @@ from arbitrage_bot.execution import ExecutionPlanBuilder, ExecutionPlanError
 from arbitrage_bot.executor import SolanaRpcClient, TradeExecutor
 from arbitrage_bot.runtime import BotRuntime
 from arbitrage_bot.scanner import ArbitrageScanner
+from arbitrage_bot.models import QuoteRequest
 from arbitrage_bot.token_config import resolve_token
 from arbitrage_bot.wallet import SolanaWallet, create_devnet_wallet, load_wallet
 
@@ -262,20 +263,6 @@ def _reconstruct_quote_response(quote: dict, slippage_bps: int = 50) -> dict:
     }
 
 
-def _buffer_quote_input(quote: dict, buffer: float) -> dict:
-    """Return a raw_quote_response copy with the input amount reduced by ``buffer``.
-    Used for the reverse leg so we never ask to swap more than the forward leg actually
-    returned (forward-leg slippage safety)."""
-    raw = dict(quote.get("metadata", {}).get("raw_quote_response") or _reconstruct_quote_response(quote))
-    factor = 1.0 - float(buffer)
-    if "inAmount" in raw:
-        raw["inAmount"] = str(int(int(raw["inAmount"]) * factor))
-    data = raw.get("data")
-    if isinstance(data, dict) and "inputAmount" in data:
-        data["inputAmount"] = str(int(int(data["inputAmount"]) * factor))
-    return raw
-
-
 def _build_swap_plan(
     builder: ExecutionPlanBuilder,
     venue: str,
@@ -391,6 +378,43 @@ def prepare_swap_execution(args: argparse.Namespace, result: dict, wallet: Solan
                 }
             )
             continue
+        # Re-fetch FRESH quotes for both legs right before building. The scan-time
+        # quotes can be seconds old by now; Raydium rejects a stale swapResponse
+        # with a generic UNKNOWN_ERROR and the trade never gets broadcast. A fresh
+        # re-quote also applies the reverse-leg slippage buffer correctly: we quote
+        # for the reduced amount instead of mutating the stale quote's inputAmount
+        # (which left the route/output internally inconsistent and also failed).
+        start_amount = int(opp.get("start_amount") or 0)
+        intermediate_amount = int(opp.get("intermediate_amount") or 0)
+        try:
+            fresh_buy = _quote_client_for(buy_venue).get_quote(
+                QuoteRequest(
+                    input_mint=base_mint,
+                    output_mint=quote_mint,
+                    amount=start_amount,
+                    slippage_bps=slippage_bps,
+                )
+            )
+            sell_input = int(intermediate_amount * (1.0 - slippage_buffer))
+            fresh_sell = _quote_client_for(sell_venue).get_quote(
+                QuoteRequest(
+                    input_mint=quote_mint,
+                    output_mint=base_mint,
+                    amount=max(sell_input, 1),
+                    slippage_bps=slippage_bps,
+                )
+            )
+        except QuoteClientError as exc:
+            skipped.append(
+                {
+                    "direction": opp.get("direction"),
+                    "reason": "fresh_quote_failed",
+                    "error": str(exc),
+                }
+            )
+            continue
+        buy_quote = fresh_buy.to_dict()
+        sell_quote = fresh_sell.to_dict()
         try:
             leg1 = _build_swap_plan(
                 builder,
@@ -403,13 +427,10 @@ def prepare_swap_execution(args: argparse.Namespace, result: dict, wallet: Solan
                 out_mint=quote_mint,
                 slippage_bps=slippage_bps,
             )
-            sell_quote_buffered = dict(sell_quote)
-            sell_quote_buffered["metadata"] = dict(sell_quote.get("metadata", {}))
-            sell_quote_buffered["metadata"]["raw_quote_response"] = _buffer_quote_input(sell_quote, slippage_buffer)
             leg2 = _build_swap_plan(
                 builder,
                 sell_venue,
-                sell_quote_buffered,
+                sell_quote,
                 wallet,
                 priority_fee_lamports=priority_fee_lamports,
                 raydium_cu_price=raydium_cu_price,
