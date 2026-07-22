@@ -296,12 +296,12 @@ def _build_swap_plan(
             priority_fee_lamports=priority_fee_lamports,
         )
     if venue == "raydium":
-        input_account = None
-        output_account = None
-        if in_mint != SOL_MINT:
-            input_account = _ata_address(wallet.public_key, in_mint)
-        if out_mint != SOL_MINT:
-            output_account = _ata_address(wallet.public_key, out_mint)
+        # Always pass the associated-token account for BOTH legs, including SOL.
+        # For SOL input/output this is the wsSOL ATA; omitting it (the previous
+        # behaviour) made Raydium's swap-base-in fail at chain simulation with
+        # "Route error: ExpectedAccount" (custom program error 0x3).
+        input_account = _ata_address(wallet.public_key, in_mint)
+        output_account = _ata_address(wallet.public_key, out_mint)
         return builder.build_raydium_swap_plan(
             public_key=wallet.public_key,
             quote_response=raw,
@@ -482,6 +482,8 @@ def execute_prepared_swaps(args: argparse.Namespace, result: dict, wallet: Solan
     if not rpc_url:
         raise ValueError("--rpc-url is required when --mode execute-swaps is used")
     rpc_client = SolanaRpcClient(rpc_url=rpc_url)
+    # Raydium wrapSol swaps require the wsSOL ATA to pre-exist; create it once if missing.
+    ensure_wsol_ata(wallet, rpc_client)
     executor = TradeExecutor(
         rpc_url=rpc_url,
         confirm_timeout_seconds=getattr(args, "confirm_timeout_seconds", 30.0),
@@ -516,11 +518,81 @@ def _ata_address(owner: str, mint: str) -> str:
     from solders.pubkey import Pubkey
 
     ata_program = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
+    token_program = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
     owner_p = Pubkey.from_string(owner)
     mint_p = Pubkey.from_string(mint)
-    seeds = [b"associated", bytes(owner_p), bytes(mint_p)]
+    # Standard SPL associated-token-account derivation: seeds are
+    # [owner, token_program, mint]. (Using b"associated" as a seed is WRONG and
+    # yields a non-existent address, which makes swaps fail at chain simulation.)
+    seeds = [bytes(owner_p), bytes(token_program), bytes(mint_p)]
     addr, _ = Pubkey.find_program_address(seeds, ata_program)
     return str(addr)
+
+
+def ensure_wsol_ata(wallet: SolanaWallet, rpc_client: "object") -> str | None:
+    """Ensure the wallet's wsSOL associated-token account exists.
+
+    Raydium's swap-base-in with wrapSol=True requires the wsSOL ATA to already
+    exist on-chain (it does NOT create it). Without it, every SOL->token swap
+    fails at chain simulation with "Route error: ExpectedAccount". This creates
+    it once (idempotent: existence is checked first) if missing. Returns the ATA
+    address, or None if it could not be ensured (the executor will then surface a
+    clear error instead of a confusing simulation failure).
+    """
+    import base64 as _b64
+    from solders.pubkey import Pubkey
+    from solders.keypair import Keypair
+    from solders.transaction import Transaction
+    from solders.instruction import Instruction, AccountMeta
+    from solders.message import Message
+    from solders.hash import Hash
+
+    ata = _ata_address(wallet.public_key, SOL_MINT)
+    owner = Pubkey.from_string(wallet.public_key)
+    ata_program = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
+    token_program = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+    sys_program = Pubkey.from_string("11111111111111111111111111111111")
+    sol_mint = Pubkey.from_string(SOL_MINT)
+
+    # Cheap existence check first (no broadcast).
+    try:
+        if rpc_client._rpc("getAccountInfo", [ata, {"encoding": "base64"}]).get("value"):
+            return ata
+    except Exception:
+        pass
+
+    ix = Instruction(
+        program_id=ata_program,
+        accounts=[
+            AccountMeta(pubkey=owner, is_signer=True, is_writable=True),
+            AccountMeta(pubkey=Pubkey.from_string(ata), is_signer=False, is_writable=True),
+            AccountMeta(pubkey=owner, is_signer=False, is_writable=False),
+            AccountMeta(pubkey=sol_mint, is_signer=False, is_writable=False),
+            AccountMeta(pubkey=sys_program, is_signer=False, is_writable=False),
+            AccountMeta(pubkey=token_program, is_signer=False, is_writable=False),
+        ],
+        data=b"",
+    )
+    kp = Keypair.from_bytes(bytes(wallet.secret_key))
+    bh = rpc_client._rpc("getLatestBlockhash", [{"commitment": "finalized"}])["value"]["blockhash"]
+    msg = Message.new_with_blockhash([ix], owner, Hash.from_string(bh))
+    tx = Transaction([kp], msg, Hash.from_string(bh))
+    raw = _b64.b64encode(bytes(tx)).decode()
+    # skip_preflight=False so a bad tx can never land; max_retries=0 (one shot).
+    try:
+        rpc_client.send_transaction(
+            raw, skip_preflight=False, preflight_commitment="finalized", max_retries=0
+        )
+    except Exception as exc:  # pragma: no cover - network/chain dependent
+        # A benign race (already created elsewhere) still leaves us fine.
+        try:
+            if rpc_client._rpc("getAccountInfo", [ata, {"encoding": "base64"}]).get("value"):
+                return ata
+        except Exception:
+            pass
+        print(f"[warn] ensure_wsol_ata: could not create wsSOL ATA: {exc}", file=sys.stderr)
+        return None
+    return ata
 
 
 def _quote_client_for(venue: str) -> "object":
