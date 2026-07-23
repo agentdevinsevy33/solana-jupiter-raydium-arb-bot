@@ -25,6 +25,7 @@ from arbitrage_bot.wallet import SolanaWallet, create_devnet_wallet, load_wallet
 
 LAMPORTS_PER_SOL = 1_000_000_000
 SOL_MINT = "So11111111111111111111111111111111111111112"
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 # Conservative per-transaction network fee estimate (Solana base fee = 5000 lamports/sig).
 NETWORK_FEE_LAMPORTS_PER_TX = 5_000
 
@@ -275,6 +276,12 @@ def _build_swap_plan(
     out_mint: str,
     slippage_bps: int,
 ) -> "object":
+    # Accept either a dict (prepare path) or a live QuoteSnapshot (rebuild_leg /
+    # _reverse_partial_plan). The latter was previously passed through unchecked
+    # and raised AttributeError inside .get(), which crashed execute_plan and
+    # defeated mid-route recovery -- stranding the intermediate asset.
+    if not isinstance(quote, dict):
+        quote = quote.to_dict()
     raw = quote.get("metadata", {}).get("raw_quote_response") or _reconstruct_quote_response(quote, slippage_bps)
     if venue == "jupiter":
         return builder.build_jupiter_swap_plan(
@@ -505,6 +512,9 @@ def execute_prepared_swaps(args: argparse.Namespace, result: dict, wallet: Solan
     rpc_client = SolanaRpcClient(rpc_url=rpc_url)
     # Raydium wrapSol swaps require the wsSOL ATA to pre-exist; create it once if missing.
     ensure_wsol_ata(wallet, rpc_client)
+    # Recover any intermediate asset stranded by a previous crashed run BEFORE we
+    # execute this cycle's round trip (so a crash between restarts can't lock funds).
+    _recover_stranded_intermediate(args, wallet, rpc_client)
     executor = TradeExecutor(
         rpc_url=rpc_url,
         confirm_timeout_seconds=getattr(args, "confirm_timeout_seconds", 30.0),
@@ -722,6 +732,46 @@ def _recover_partial_plans(args: argparse.Namespace, wallet: SolanaWallet, rpc_c
                 _reverse_partial_plan(args, wallet, rpc_client, item)
             except Exception as exc:  # noqa: BLE001 - recovery must never crash the run
                 print(json.dumps({"error": f"mid_route_recovery_failed: {exc}"}))
+
+
+# Minimum amount (in UI units, e.g. whole USDC) that counts as a *stranded*
+# intermediate balance worth auto-recovering. Below this we assume harmless
+# dust (ATA reserves / rounding), not a stranded round trip.
+STRANDED_RECOVERY_MIN_UI = 1.0
+
+
+def _recover_stranded_intermediate(args: argparse.Namespace, wallet: SolanaWallet, rpc_client: "object") -> None:
+    """Safety net against permanently stranded intermediate assets.
+
+    If a previous run crashed mid-round-trip (base->quote leg confirmed, quote->base
+    leg never executed) the wallet is left holding the quote asset. Sell any
+    clearly-stranded quote balance back to base at the start of every execute cycle,
+    so a crash between restarts can never lock up funds. Runs BEFORE normal
+    execution, so it never touches a balance the current cycle is about to use.
+    """
+    quote_mint = getattr(args, "quote_mint", None) or USDC_MINT
+    if quote_mint == SOL_MINT:
+        return
+    try:
+        amount = _actual_input_amount(rpc_client, wallet.public_key, quote_mint, fallback=0)
+    except Exception:
+        return
+    if amount <= 0:
+        return
+    ui_amount = amount / 1_000_000.0
+    if ui_amount < STRANDED_RECOVERY_MIN_UI:
+        return
+    print(json.dumps({"info": "stranded intermediate asset detected before cycle; recovering", "mint": quote_mint, "amount_ui": ui_amount}))
+    plan_result = {
+        "metadata": {
+            "legs": [{"in_mint": SOL_MINT, "out_mint": quote_mint, "amount": 0}],
+            "buy_venue": getattr(args, "left_venue", "raydium"),
+        }
+    }
+    try:
+        _reverse_partial_plan(args, wallet, rpc_client, plan_result)
+    except Exception as exc:  # noqa: BLE001 - recovery must never abort the cycle
+        print(json.dumps({"error": f"stranded_recovery_failed: {exc}"}))
 
 
 def main() -> int:

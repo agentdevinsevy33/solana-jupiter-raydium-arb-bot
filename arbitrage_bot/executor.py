@@ -206,7 +206,14 @@ class TradeExecutor:
                 except (ExecutorError, RpcResponseError) as exc:
                     last_exc = exc
                     if can_retry and attempt < self.max_leg_retries:
-                        fresh = self.rebuild_leg(plan, index)
+                        try:
+                            fresh = self.rebuild_leg(plan, index)
+                        except Exception as rebuild_exc:  # noqa: BLE001
+                            # A rebuild failure must NEVER crash execute_plan: the caller
+                            # needs the partial result so mid-route recovery can sell the
+                            # intermediate asset back. Raising here previously stranded funds.
+                            last_exc = rebuild_exc
+                            fresh = None
                         if fresh is not None and getattr(fresh, "transactions_base64", None):
                             tx_to_send = fresh.transactions_base64[0]
                             continue
