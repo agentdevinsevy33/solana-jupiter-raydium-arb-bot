@@ -212,8 +212,26 @@ class TradeExecutor:
                             continue
                     break
             if not confirmed:
-                # Surface the failure so the caller records + stops the plan.
-                raise last_exc if last_exc else ExecutorError(f"Leg {index} failed to confirm")
+                # Record the failed leg and stop the plan, but DO NOT raise: the
+                # caller needs the partial result (which legs confirmed vs failed)
+                # so mid-route recovery (_recover_partial_plans) can sell the
+                # intermediate asset back. Raising here previously discarded that
+                # info and stranded funds on every later-leg failure.
+                tx_results.append(
+                    {
+                        "transaction_index": index,
+                        "attempt": attempt,
+                        "local_signature": None,
+                        "rpc_signature": None,
+                        "send_latency_ms": None,
+                        "confirm_latency_ms": None,
+                        "slot": None,
+                        "confirmations": None,
+                        "confirmation_status": None,
+                        "err": str(last_exc) if last_exc else "leg failed to confirm",
+                    }
+                )
+                break
 
         confirmed_count = sum(
             1
