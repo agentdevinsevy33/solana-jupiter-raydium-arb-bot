@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
@@ -88,6 +88,28 @@ class SolanaRpcClient:
             raise RpcResponseError(f"getSignatureStatuses returned malformed status: {status!r}")
         return status
 
+    def get_wallet_lamport_delta(self, signature: str, public_key: str, commitment: str) -> int | None:
+        result = self._rpc(
+            "getTransaction",
+            [signature, {"encoding": "jsonParsed", "commitment": commitment, "maxSupportedTransactionVersion": 0}],
+        )
+        if not isinstance(result, dict):
+            return None
+        transaction = result.get("transaction") or {}
+        message = transaction.get("message") or {}
+        keys = message.get("accountKeys") or []
+        normalized = [item.get("pubkey") if isinstance(item, dict) else item for item in keys]
+        try:
+            index = normalized.index(public_key)
+        except ValueError:
+            return None
+        meta = result.get("meta") or {}
+        pre = meta.get("preBalances") or []
+        post = meta.get("postBalances") or []
+        if index >= len(pre) or index >= len(post):
+            return None
+        return int(post[index]) - int(pre[index])
+
 
 class TradeExecutor:
     def __init__(
@@ -101,7 +123,8 @@ class TradeExecutor:
         skip_preflight: bool = False,
         commitment: str = "confirmed",
         max_retries: int = 3,
-        rebuild_leg: Callable[[dict[str, Any], int], "object"] | None = None,
+        rebuild_leg: Callable[..., "object"] | None = None,
+        balance_reader: Callable[[str], int] | None = None,
         max_leg_retries: int = 3,
     ) -> None:
         self.rpc_client = SolanaRpcClient(rpc_url=rpc_url, session=session, timeout=timeout)
@@ -114,6 +137,7 @@ class TradeExecutor:
         # quote. Used to retry a later leg whose broadcast failed because its
         # pre-built transaction went stale (e.g. Jupiter 0x1771).
         self.rebuild_leg = rebuild_leg
+        self.balance_reader = balance_reader
         self.max_leg_retries = max(0, int(max_leg_retries))
 
     def execute_prepared_swaps(self, wallet: SolanaWallet, prepared_swaps: list[dict[str, Any]]) -> dict[str, Any]:
@@ -164,17 +188,38 @@ class TradeExecutor:
         if not transactions:
             raise ExecutorError(f"Prepared swap for venue {plan.get('venue', 'unknown')} did not include any transactions")
 
+        metadata = dict(plan.get("metadata") or {})
+        deferred_leg_index = metadata.get("deferred_leg_index")
+        legs = metadata.get("legs") or []
+        deferred_mint: str | None = None
+        balance_before: int | None = None
+        if deferred_leg_index is not None:
+            if self.commitment == "processed":
+                raise ExecutorError("Deferred two-leg execution requires confirmed or finalized commitment")
+            if self.rebuild_leg is None or self.balance_reader is None:
+                raise ExecutorError("Deferred second leg requires rebuild_leg and balance_reader")
+            if not isinstance(deferred_leg_index, int) or deferred_leg_index >= len(legs):
+                raise ExecutorError("Deferred second-leg metadata is malformed")
+            deferred_mint = legs[deferred_leg_index].get("in_mint")
+            if not deferred_mint:
+                raise ExecutorError("Deferred second leg did not specify an input mint")
+            balance_before = int(self.balance_reader(deferred_mint))
+
         tx_results: list[dict[str, Any]] = []
         for index, transaction_base64 in enumerate(transactions):
             tx_to_send = transaction_base64
             confirmed = False
             last_exc: Exception | None = None
+            local_signature: str | None = None
+            rpc_signature: str | None = None
             # Later legs can be re-derived from a fresh quote if they fail at
             # broadcast/simulation (e.g. stale Jupiter quote -> 0x1771). The
             # first leg is the entry point and is never re-derived.
-            can_retry = index > 0 and self.rebuild_leg is not None
+            can_retry = deferred_leg_index is None and index > 0 and self.rebuild_leg is not None
             for attempt in range(1 + (self.max_leg_retries if can_retry else 0)):
                 try:
+                    local_signature = None
+                    rpc_signature = None
                     signed_transaction_base64, local_signature = self._sign_transaction_base64(wallet, tx_to_send)
                     send_started = time.monotonic()
                     rpc_signature = self.rpc_client.send_transaction(
@@ -199,11 +244,12 @@ class TradeExecutor:
                             "confirmations": status.get("confirmations") if status else None,
                             "confirmation_status": status.get("confirmationStatus") if status else None,
                             "err": status.get("err") if status else None,
+                            "wallet_lamport_delta": self._wallet_delta_safe(rpc_signature, wallet.public_key),
                         }
                     )
                     confirmed = True
                     break
-                except (ExecutorError, RpcResponseError) as exc:
+                except (ExecutorError, RpcResponseError, requests.RequestException) as exc:
                     last_exc = exc
                     if can_retry and attempt < self.max_leg_retries:
                         try:
@@ -219,42 +265,136 @@ class TradeExecutor:
                             continue
                     break
             if not confirmed:
-                # Record the failed leg and stop the plan, but DO NOT raise: the
-                # caller needs the partial result (which legs confirmed vs failed)
-                # so mid-route recovery (_recover_partial_plans) can sell the
-                # intermediate asset back. Raising here previously discarded that
-                # info and stranded funds on every later-leg failure.
+                # Once RPC may have accepted a transaction, a transport error or
+                # confirmation timeout is ambiguous. A structured RPC simulation
+                # rejection is definitive and remains eligible for recovery.
+                ambiguous = rpc_signature is not None or (
+                    local_signature is not None and isinstance(last_exc, requests.RequestException)
+                )
+                if ambiguous:
+                    metadata["recovery_blocked_ambiguous_broadcast"] = True
                 tx_results.append(
                     {
                         "transaction_index": index,
                         "attempt": attempt,
-                        "local_signature": None,
-                        "rpc_signature": None,
+                        "local_signature": local_signature,
+                        "rpc_signature": rpc_signature,
                         "send_latency_ms": None,
                         "confirm_latency_ms": None,
                         "slot": None,
                         "confirmations": None,
                         "confirmation_status": None,
                         "err": str(last_exc) if last_exc else "leg failed to confirm",
+                        "ambiguous_broadcast": ambiguous,
                     }
                 )
                 break
+
+        entry_confirmed = len(tx_results) == len(transactions) and all(
+            tx.get("confirmation_status") in {"confirmed", "finalized"} and tx.get("err") is None
+            for tx in tx_results
+        )
+        if deferred_leg_index is not None and entry_confirmed:
+            received_amount = 0
+            local_signature: str | None = None
+            rpc_signature: str | None = None
+            try:
+                balance_after = int(self.balance_reader(deferred_mint))  # type: ignore[arg-type, misc]
+                received_amount = balance_after - int(balance_before or 0)
+                if received_amount <= 0:
+                    raise ExecutorError(f"Confirmed entry leg produced no positive {deferred_mint} balance delta")
+                metadata["actual_intermediate_amount"] = received_amount
+                fresh_plan = self.rebuild_leg(plan, deferred_leg_index, received_amount)  # type: ignore[misc]
+                fresh_transactions = list(getattr(fresh_plan, "transactions_base64", None) or [])
+                if not fresh_transactions:
+                    raise ExecutorError("Fresh second-leg builder returned no transactions")
+                for transaction_base64 in fresh_transactions:
+                    index = len(tx_results)
+                    local_signature = None
+                    rpc_signature = None
+                    signed_transaction_base64, local_signature = self._sign_transaction_base64(wallet, transaction_base64)
+                    send_started = time.monotonic()
+                    rpc_signature = self.rpc_client.send_transaction(
+                        signed_transaction_base64,
+                        skip_preflight=self.skip_preflight,
+                        preflight_commitment=self.commitment,
+                        max_retries=self.max_retries,
+                    )
+                    send_latency_ms = round((time.monotonic() - send_started) * 1000, 3)
+                    confirm_started = time.monotonic()
+                    status = self._confirm_signature(rpc_signature)
+                    tx_results.append(
+                        {
+                            "transaction_index": index,
+                            "leg_index": deferred_leg_index,
+                            "attempt": 0,
+                            "local_signature": local_signature,
+                            "rpc_signature": rpc_signature,
+                            "send_latency_ms": send_latency_ms,
+                            "confirm_latency_ms": round((time.monotonic() - confirm_started) * 1000, 3),
+                            "slot": status.get("slot") if status else None,
+                            "confirmations": status.get("confirmations") if status else None,
+                            "confirmation_status": status.get("confirmationStatus") if status else None,
+                            "err": status.get("err") if status else None,
+                            "wallet_lamport_delta": self._wallet_delta_safe(rpc_signature, wallet.public_key),
+                            "actual_input_amount": received_amount,
+                        }
+                    )
+            except Exception as exc:  # noqa: BLE001 - preserve partial state
+                # A returned RPC signature means the transaction may still land.
+                # Never launch an automatic recovery sell in that ambiguous state.
+                ambiguous = rpc_signature is not None or (
+                    local_signature is not None and isinstance(exc, requests.RequestException)
+                )
+                if ambiguous:
+                    metadata["recovery_blocked_ambiguous_broadcast"] = True
+                tx_results.append(
+                    {
+                        "transaction_index": len(tx_results),
+                        "leg_index": deferred_leg_index,
+                        "attempt": 0,
+                        "local_signature": local_signature,
+                        "rpc_signature": rpc_signature,
+                        "send_latency_ms": None,
+                        "confirm_latency_ms": None,
+                        "slot": None,
+                        "confirmations": None,
+                        "confirmation_status": None,
+                        "err": str(exc),
+                        "actual_input_amount": received_amount or None,
+                        "ambiguous_broadcast": ambiguous,
+                    }
+                )
 
         confirmed_count = sum(
             1
             for tx in tx_results
             if tx.get("confirmation_status") in {"processed", "confirmed", "finalized"} and tx.get("err") is None
         )
+        deferred_confirmed = deferred_leg_index is None or any(
+            tx.get("leg_index") == deferred_leg_index
+            and tx.get("confirmation_status") in {"processed", "confirmed", "finalized"}
+            and tx.get("err") is None
+            for tx in tx_results
+        )
+        all_recorded_ok = bool(tx_results) and all(tx.get("err") is None for tx in tx_results)
+        plan_ok = entry_confirmed and deferred_confirmed and all_recorded_ok
         return {
             "venue": plan.get("venue", "unknown"),
             "public_key": plan.get("public_key", wallet.public_key),
             "transaction_count": len(tx_results),
             "confirmed_transaction_count": confirmed_count,
-            "partial": 0 < confirmed_count < len(transactions),
-            "ok": confirmed_count == len(transactions),
+            "partial": confirmed_count > 0 and not plan_ok,
+            "ok": plan_ok,
             "transactions": tx_results,
-            "metadata": dict(plan.get("metadata") or {}),
+            "metadata": metadata,
         }
+
+    def _wallet_delta_safe(self, signature: str, public_key: str) -> int | None:
+        try:
+            return self.rpc_client.get_wallet_lamport_delta(signature, public_key, self.commitment)
+        except Exception:  # telemetry failure must not change execution outcome
+            return None
 
     def _confirm_signature(self, signature: str) -> dict[str, Any]:
         deadline = time.monotonic() + max(self.confirm_timeout_seconds, 0.0)

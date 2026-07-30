@@ -108,6 +108,77 @@ class ExecutorTest(unittest.TestCase):
         self.assertEqual(session.requests[1]["json"]["method"], "getSignatureStatuses")
         self.assertEqual(FakeVersionedTransaction.signed_instances[0].message, {"decoded": b"\x01\x02\x03"})
 
+    def test_deferred_second_leg_uses_confirmed_balance_delta(self) -> None:
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        balances = iter([7, 107])
+        built_amounts = []
+
+        def rebuild(plan, leg_index, actual_amount):
+            built_amounts.append((leg_index, actual_amount))
+            return SimpleNamespace(transactions_base64=["BAIF"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wallet = create_devnet_wallet(Path(tmp) / "wallet.json")
+            executor = TradeExecutor(
+                rpc_url="https://example-rpc.invalid",
+                session=FakeRpcSession(),
+                confirm_timeout_seconds=0.1,
+                poll_interval_seconds=0.0,
+                rebuild_leg=rebuild,
+                balance_reader=lambda mint: next(balances),
+            )
+            plan = {
+                "venue": "jupiter_to_raydium",
+                "public_key": wallet.public_key,
+                "transactions_base64": ["AQID"],
+                "metadata": {
+                    "deferred_leg_index": 1,
+                    "legs": [
+                        {"in_mint": "SOL", "out_mint": "USDC"},
+                        {"in_mint": "USDC", "out_mint": "SOL", "deferred": True},
+                    ],
+                },
+            }
+            with patch.object(TradeExecutor, "_load_solders", return_value=(FakeKeypair, FakeVersionedTransaction)):
+                result = executor.execute_prepared_swaps(wallet, [plan])
+
+        self.assertTrue(result["execution_results"][0]["ok"])
+        self.assertEqual(built_amounts, [(1, 100)])
+        txs = result["execution_results"][0]["transactions"]
+        self.assertEqual(len(txs), 2)
+        self.assertEqual(txs[1]["actual_input_amount"], 100)
+        self.assertEqual(result["execution_results"][0]["metadata"]["actual_intermediate_amount"], 100)
+
+    def test_deferred_plan_rejects_processed_commitment(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wallet = create_devnet_wallet(Path(tmp) / "wallet.json")
+            executor = TradeExecutor(
+                rpc_url="https://example-rpc.invalid",
+                session=FakeRpcSession(),
+                commitment="processed",
+                rebuild_leg=lambda *args: None,
+                balance_reader=lambda mint: 0,
+            )
+            plan = {
+                "venue": "jupiter_to_raydium",
+                "transactions_base64": ["AQID"],
+                "metadata": {
+                    "deferred_leg_index": 1,
+                    "legs": [{"in_mint": "SOL"}, {"in_mint": "USDC"}],
+                },
+            }
+            result = executor.execute_prepared_swaps(wallet, [plan])
+
+        self.assertFalse(result["execution_results"][0]["ok"])
+        self.assertIn("confirmed or finalized", result["execution_results"][0]["error"])
+
 
 class BuildSwapPlanQuoteSnapshotTest(unittest.TestCase):
     """Regression: _build_swap_plan must accept a live QuoteSnapshot object.

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -96,8 +97,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--execute-slippage-buffer",
         type=float,
         default=0.01,
-        help="Fraction to reduce the reverse-leg input by to stay safe against forward-leg slippage",
+        help="Deprecated: leg 2 is now sized from the actual confirmed token balance delta",
     )
+    parser.add_argument(
+        "--execution-drift-buffer-bps",
+        type=float,
+        default=10.0,
+        help="Extra round-trip basis-point reserve for non-atomic cross-leg price drift",
+    )
+    parser.add_argument("--max-consecutive-losses", type=int, default=2, help="Persistently halt execution after this many realized losing round trips")
+    parser.add_argument("--max-daily-loss-sol", type=float, default=0.002, help="Persistently halt execution after this much realized daily SOL loss")
+    parser.add_argument("--risk-state-path", default="data/execution-risk.json", help="Persistent execution circuit-breaker state")
     parser.add_argument("--max-cycles", type=int, default=0, help="Optional cap for loop iterations when running continuously")
     return parser.parse_args(argv)
 
@@ -309,15 +319,19 @@ def _build_swap_plan(
 
 
 def estimate_net_profit_bps(
-    opp: dict, *, priority_fee_lamports: int, network_fee_lamports: int = NETWORK_FEE_LAMPORTS_PER_TX
+    opp: dict,
+    *,
+    priority_fee_lamports: int,
+    network_fee_lamports: int = NETWORK_FEE_LAMPORTS_PER_TX,
+    slippage_bps: int = 0,
+    drift_buffer_bps: float = 0.0,
 ) -> float:
-    """Gross opportunity profit minus estimated round-trip transaction fees, in bps."""
+    """Conservative edge after fixed fees, two-leg slippage, and drift reserve."""
     start = opp.get("start_amount") or 0
     gross_bps = opp.get("profit_bps", 0.0)
-    # Round trip = 2 swaps: network fee + priority fee on each.
     fee_lamports = 2 * (network_fee_lamports + priority_fee_lamports)
     fee_bps = (fee_lamports / start) * 10_000 if start else 0.0
-    return gross_bps - fee_bps
+    return gross_bps - fee_bps - (2 * max(slippage_bps, 0)) - max(drift_buffer_bps, 0.0)
 
 
 def prepare_swap_execution(args: argparse.Namespace, result: dict, wallet: SolanaWallet) -> dict:
@@ -346,8 +360,8 @@ def prepare_swap_execution(args: argparse.Namespace, result: dict, wallet: Solan
     priority_fee_lamports = int(getattr(args, "priority_fee_lamports", 20_000))
     raydium_cu_price = int(getattr(args, "raydium_compute_unit_price_micro_lamports", 50_000))
     max_opps = int(getattr(args, "max_execute_opportunities", 1))
-    slippage_buffer = float(getattr(args, "execute_slippage_buffer", 0.01))
     slippage_bps = int(getattr(args, "slippage_bps", 50))
+    drift_buffer_bps = float(getattr(args, "execution_drift_buffer_bps", 10.0))
 
     builder = ExecutionPlanBuilder()
     plans: list[dict] = []
@@ -360,7 +374,12 @@ def prepare_swap_execution(args: argparse.Namespace, result: dict, wallet: Solan
         if gross_bps < execute_min_profit_bps:
             skipped.append({"direction": opp.get("direction"), "reason": "below_gross_threshold", "gross_profit_bps": gross_bps})
             continue
-        net_bps = estimate_net_profit_bps(opp, priority_fee_lamports=priority_fee_lamports)
+        net_bps = estimate_net_profit_bps(
+            opp,
+            priority_fee_lamports=priority_fee_lamports,
+            slippage_bps=slippage_bps,
+            drift_buffer_bps=drift_buffer_bps,
+        )
         if net_bps < execute_min_profit_bps:
             skipped.append(
                 {
@@ -392,7 +411,6 @@ def prepare_swap_execution(args: argparse.Namespace, result: dict, wallet: Solan
         # for the reduced amount instead of mutating the stale quote's inputAmount
         # (which left the route/output internally inconsistent and also failed).
         start_amount = int(opp.get("start_amount") or 0)
-        intermediate_amount = int(opp.get("intermediate_amount") or 0)
         try:
             fresh_buy = _quote_client_for(buy_venue).get_quote(
                 QuoteRequest(
@@ -402,7 +420,9 @@ def prepare_swap_execution(args: argparse.Namespace, result: dict, wallet: Solan
                     slippage_bps=slippage_bps,
                 )
             )
-            sell_input = int(intermediate_amount * (1.0 - slippage_buffer))
+            # Chain the validation quote from the freshly quoted leg-1 output.
+            # The executable leg 2 remains deferred until actual settlement.
+            sell_input = int(fresh_buy.out_amount)
             fresh_sell = _quote_client_for(sell_venue).get_quote(
                 QuoteRequest(
                     input_mint=quote_mint,
@@ -422,6 +442,28 @@ def prepare_swap_execution(args: argparse.Namespace, result: dict, wallet: Solan
             continue
         buy_quote = fresh_buy.to_dict()
         sell_quote = fresh_sell.to_dict()
+        fresh_gross_bps = (
+            ((int(fresh_sell.out_amount) - start_amount) / start_amount) * 10_000
+            if start_amount
+            else 0.0
+        )
+        fresh_net_bps = estimate_net_profit_bps(
+            {"start_amount": start_amount, "profit_bps": fresh_gross_bps},
+            priority_fee_lamports=priority_fee_lamports,
+            slippage_bps=slippage_bps,
+            drift_buffer_bps=drift_buffer_bps,
+        )
+        if fresh_net_bps < execute_min_profit_bps:
+            skipped.append(
+                {
+                    "direction": opp.get("direction"),
+                    "reason": "fresh_round_trip_below_safe_threshold",
+                    "fresh_gross_profit_bps": fresh_gross_bps,
+                    "safe_net_profit_bps": fresh_net_bps,
+                }
+            )
+            continue
+        net_bps = fresh_net_bps
         try:
             leg1 = _build_swap_plan(
                 builder,
@@ -434,17 +476,6 @@ def prepare_swap_execution(args: argparse.Namespace, result: dict, wallet: Solan
                 out_mint=quote_mint,
                 slippage_bps=slippage_bps,
             )
-            leg2 = _build_swap_plan(
-                builder,
-                sell_venue,
-                sell_quote,
-                wallet,
-                priority_fee_lamports=priority_fee_lamports,
-                raydium_cu_price=raydium_cu_price,
-                in_mint=quote_mint,
-                out_mint=base_mint,
-                slippage_bps=slippage_bps,
-            )
         except (ExecutionPlanError, Exception) as exc:  # noqa: BLE001 - skip this opp, never abort the run
             skipped.append({"direction": opp.get("direction"), "reason": "plan_build_failed", "error": str(exc)})
             continue
@@ -453,8 +484,8 @@ def prepare_swap_execution(args: argparse.Namespace, result: dict, wallet: Solan
             {
                 "venue": f"{buy_venue}_to_{sell_venue}",
                 "public_key": wallet.public_key,
-                "transactions_base64": leg1.transactions_base64 + leg2.transactions_base64,
-                "transaction_count": leg1.transaction_count + leg2.transaction_count,
+                "transactions_base64": leg1.transactions_base64,
+                "transaction_count": leg1.transaction_count,
                 "metadata": {
                     "direction": opp.get("direction"),
                     "buy_venue": buy_venue,
@@ -462,9 +493,10 @@ def prepare_swap_execution(args: argparse.Namespace, result: dict, wallet: Solan
                     "start_amount": opp.get("start_amount"),
                     "intermediate_amount": opp.get("intermediate_amount"),
                     "end_amount": opp.get("end_amount"),
-                    "gross_profit_bps": gross_bps,
+                    "gross_profit_bps": fresh_gross_bps,
                     "est_net_profit_bps": net_bps,
                     "priority_fee_lamports": priority_fee_lamports,
+                    "deferred_leg_index": 1,
                     "legs": [
                         {
                             **leg1.metadata,
@@ -475,11 +507,11 @@ def prepare_swap_execution(args: argparse.Namespace, result: dict, wallet: Solan
                             "slippage_bps": slippage_bps,
                         },
                         {
-                            **leg2.metadata,
                             "venue": sell_venue,
                             "in_mint": quote_mint,
                             "out_mint": base_mint,
-                            "amount": opp.get("intermediate_amount"),
+                            "amount": None,
+                            "deferred": True,
                             "slippage_bps": slippage_bps,
                         },
                     ],
@@ -505,16 +537,109 @@ def _augment_result_with_execution_preparation(args: argparse.Namespace, result:
     return result
 
 
+def _risk_state(args: argparse.Namespace) -> tuple[Path, dict]:
+    path = Path(getattr(args, "risk_state_path", "data/execution-risk.json"))
+    today = datetime.now(timezone.utc).date().isoformat()
+    state = {"date": today, "consecutive_losses": 0, "daily_loss_lamports": 0, "halted": False, "halt_reason": None}
+    try:
+        loaded = json.loads(path.read_text())
+        if isinstance(loaded, dict):
+            state.update(loaded)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    if state.get("date") != today:
+        state["date"] = today
+        state["daily_loss_lamports"] = 0
+        if state.get("halt_reason") == "daily_loss_limit":
+            state["halted"] = False
+            state["halt_reason"] = None
+    return path, state
+
+
+def _save_risk_state(path: Path, state: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(state, indent=2) + "\n")
+    temporary.replace(path)
+
+
+def _update_risk_state(args: argparse.Namespace, exec_out: dict, path: Path, state: dict) -> dict:
+    summary = exec_out.get("execution_summary") or {}
+    results = exec_out.get("execution_results") or []
+    all_transactions = [tx for result in results for tx in result.get("transactions", [])]
+    ambiguous = any(tx.get("ambiguous_broadcast") for tx in all_transactions) or any(
+        (result.get("metadata") or {}).get("recovery_blocked_ambiguous_broadcast") for result in results
+    )
+    if results and (ambiguous or not summary.get("completed")):
+        known_negative = sum(
+            abs(int(tx["wallet_lamport_delta"]))
+            for tx in all_transactions
+            if tx.get("wallet_lamport_delta") is not None and int(tx["wallet_lamport_delta"]) < 0
+        )
+        state["daily_loss_lamports"] = int(state.get("daily_loss_lamports", 0)) + known_negative
+        state["consecutive_losses"] = int(state.get("consecutive_losses", 0)) + 1
+        state["halted"] = True
+        state["halt_reason"] = "ambiguous_broadcast" if ambiguous else "incomplete_round_trip"
+        state["last_measurement"] = "partial_or_uncertain_execution"
+        _save_risk_state(path, state)
+        return state
+    if not summary.get("completed") or not results:
+        return state
+    confirmed = [
+        tx
+        for result in exec_out.get("execution_results", [])
+        for tx in result.get("transactions", [])
+        if tx.get("err") is None and tx.get("confirmation_status") in {"confirmed", "finalized"}
+    ]
+    deltas = [tx.get("wallet_lamport_delta") for tx in confirmed]
+    if not confirmed or any(delta is None for delta in deltas):
+        state["last_measurement"] = "unavailable"
+        _save_risk_state(path, state)
+        return state
+    realized = sum(int(delta) for delta in deltas)
+    state["last_realized_lamports"] = realized
+    state["last_measurement"] = "confirmed_transaction_balances"
+    if realized < 0:
+        state["consecutive_losses"] = int(state.get("consecutive_losses", 0)) + 1
+        state["daily_loss_lamports"] = int(state.get("daily_loss_lamports", 0)) + abs(realized)
+    else:
+        state["consecutive_losses"] = 0
+    max_losses = max(int(getattr(args, "max_consecutive_losses", 2)), 1)
+    max_daily = max(int(float(getattr(args, "max_daily_loss_sol", 0.002)) * LAMPORTS_PER_SOL), 1)
+    if int(state.get("consecutive_losses", 0)) >= max_losses:
+        state["halted"] = True
+        state["halt_reason"] = "consecutive_loss_limit"
+    elif int(state.get("daily_loss_lamports", 0)) >= max_daily:
+        state["halted"] = True
+        state["halt_reason"] = "daily_loss_limit"
+    _save_risk_state(path, state)
+    return state
+
+
 def execute_prepared_swaps(args: argparse.Namespace, result: dict, wallet: SolanaWallet) -> dict:
     rpc_url = getattr(args, "rpc_url", "") or ""
     if not rpc_url:
         raise ValueError("--rpc-url is required when --mode execute-swaps is used")
+    risk_path, risk = _risk_state(args)
+    if risk.get("halted") and result.get("prepared_swaps"):
+        return {
+            "execution_results": [],
+            "execution_summary": {
+                "completed": False,
+                "stop_reason": f"risk_circuit_breaker:{risk.get('halt_reason')}",
+                "plan_count": len(result.get("prepared_swaps", [])),
+                "plans_executed": 0,
+                "submitted_transaction_count": 0,
+                "confirmed_transaction_count": 0,
+            },
+            "risk_state": risk,
+        }
     rpc_client = SolanaRpcClient(rpc_url=rpc_url)
     # Raydium wrapSol swaps require the wsSOL ATA to pre-exist; create it once if missing.
     ensure_wsol_ata(wallet, rpc_client)
-    # Recover any intermediate asset stranded by a previous crashed run BEFORE we
-    # execute this cycle's round trip (so a crash between restarts can't lock funds).
-    _recover_stranded_intermediate(args, wallet, rpc_client)
+    # Do not auto-liquidate arbitrary pre-existing quote-token balances here.
+    # Exact delta-scoped recovery is performed only when this process observed
+    # leg 1 settle and leg 2 definitively failed before broadcast.
     executor = TradeExecutor(
         rpc_url=rpc_url,
         confirm_timeout_seconds=getattr(args, "confirm_timeout_seconds", 30.0),
@@ -523,10 +648,13 @@ def execute_prepared_swaps(args: argparse.Namespace, result: dict, wallet: Solan
         commitment=getattr(args, "commitment", "confirmed"),
         max_retries=getattr(args, "max_send_retries", 3),
         rebuild_leg=_make_rebuild_leg(args, wallet, rpc_client),
+        balance_reader=lambda mint: _actual_input_amount(rpc_client, wallet.public_key, mint),
         max_leg_retries=int(getattr(args, "max_leg_retries", 3)),
     )
     out = executor.execute_prepared_swaps(wallet, result.get("prepared_swaps", []))
     _recover_partial_plans(args, wallet, rpc_client, out)
+    risk = _update_risk_state(args, out, risk_path, risk)
+    out["risk_state"] = risk
     return out
 
 
@@ -634,18 +762,21 @@ def _quote_client_for(venue: str) -> "object":
     raise ExecutionPlanError(f"No quote client available for venue '{venue}'")
 
 
-def _actual_input_amount(rpc_client: "object", pubkey: str, mint: str, fallback: int) -> int:
-    """Actual balance of ``mint`` held by the wallet, used to re-quote a leg
-    against reality (handles partial fills / dust)."""
+def _actual_input_amount(rpc_client: "object", pubkey: str, mint: str, fallback: int = 0) -> int:
+    """Return the confirmed wallet balance for a mint; never invent a fallback."""
     if mint == SOL_MINT:
-        lamports = rpc_client._rpc("getBalance", [pubkey])["value"]
+        lamports = rpc_client._rpc("getBalance", [pubkey, {"commitment": "confirmed"}])["value"]
         rent_reserve = 5_000_000
-        return max(lamports - rent_reserve, 0)
-    ata = rpc_client._rpc("getTokenAccountsByOwner", [pubkey, {"mint": mint}, {"encoding": "jsonParsed"}])
-    values = (ata.get("value") or []) if isinstance(ata, dict) else []
-    if not values:
-        return int(fallback or 0)
-    return int(values[0]["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"])
+        return max(int(lamports) - rent_reserve, 0)
+    response = rpc_client._rpc(
+        "getTokenAccountsByOwner",
+        [pubkey, {"mint": mint}, {"encoding": "jsonParsed", "commitment": "confirmed"}],
+    )
+    values = (response.get("value") or []) if isinstance(response, dict) else []
+    return sum(
+        int(item["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"])
+        for item in values
+    )
 
 
 def _make_rebuild_leg(args: argparse.Namespace, wallet: SolanaWallet, rpc_client: "object"):
@@ -654,14 +785,16 @@ def _make_rebuild_leg(args: argparse.Namespace, wallet: SolanaWallet, rpc_client
     cu_price = int(getattr(args, "raydium_compute_unit_price_micro_lamports", 50_000))
     slippage_bps = int(getattr(args, "slippage_bps", 50))
 
-    def rebuild_leg(plan: dict, index: int):
+    def rebuild_leg(plan: dict, index: int, actual_amount: int | None = None):
         legs = (plan.get("metadata") or {}).get("legs") or [None, None]
         leg_meta = legs[index] if index < len(legs) else None
         if not leg_meta:
             return None
         in_mint = leg_meta["in_mint"]
         out_mint = leg_meta["out_mint"]
-        amount = _actual_input_amount(rpc_client, wallet.public_key, in_mint, fallback=leg_meta.get("amount") or 0)
+        amount = int(actual_amount) if actual_amount is not None else _actual_input_amount(
+            rpc_client, wallet.public_key, in_mint
+        )
         if amount <= 0:
             return None
         client = _quote_client_for(leg_meta["venue"])
@@ -696,7 +829,11 @@ def _reverse_partial_plan(args: argparse.Namespace, wallet: SolanaWallet, rpc_cl
     quote_mint = legs[0].get("out_mint")
     if not (buy_venue and base_mint and quote_mint):
         return
-    amount = _actual_input_amount(rpc_client, wallet.public_key, quote_mint, fallback=0)
+    wallet_amount = _actual_input_amount(rpc_client, wallet.public_key, quote_mint, fallback=0)
+    trade_amount = int(meta.get("actual_intermediate_amount") or 0)
+    # Recover only what this round trip received; never liquidate unrelated
+    # pre-existing holdings in the same mint.
+    amount = min(wallet_amount, trade_amount) if trade_amount > 0 else 0
     if amount <= 0:
         return
     client = _quote_client_for(buy_venue)
@@ -727,6 +864,13 @@ def _reverse_partial_plan(args: argparse.Namespace, wallet: SolanaWallet, rpc_cl
 def _recover_partial_plans(args: argparse.Namespace, wallet: SolanaWallet, rpc_client: "object", exec_out: dict) -> None:
     for item in exec_out.get("execution_results", []):
         if item.get("partial"):
+            meta = item.get("metadata") or {}
+            if meta.get("recovery_blocked_ambiguous_broadcast"):
+                print(json.dumps({
+                    "critical": "automatic recovery blocked: second-leg broadcast status is ambiguous",
+                    "venue": item.get("venue"),
+                }))
+                continue
             print(json.dumps({"warning": "partial round-trip execution detected; attempting midroute recovery", "venue": item.get("venue")}))
             try:
                 _reverse_partial_plan(args, wallet, rpc_client, item)
