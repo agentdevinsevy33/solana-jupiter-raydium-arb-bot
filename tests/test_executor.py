@@ -153,6 +153,80 @@ class ExecutorTest(unittest.TestCase):
         self.assertEqual(txs[1]["actual_input_amount"], 100)
         self.assertEqual(result["execution_results"][0]["metadata"]["actual_intermediate_amount"], 100)
 
+    def test_deferred_second_leg_requotes_after_definitive_onchain_failure(self) -> None:
+        """A confirmed 6001-like failure is safe to retry from a fresh quote."""
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        class RetrySession(FakeRpcSession):
+            def __init__(self):
+                super().__init__()
+                self.send_count = 0
+                self.status_for_signature = {}
+
+            def post(self, url, json=None, timeout=None, headers=None):
+                method = json["method"]
+                if method == "sendTransaction":
+                    self.send_count += 1
+                    sig = f"rpc-signature-{self.send_count}"
+                    self.status_for_signature[sig] = {
+                        "slot": 99 + self.send_count,
+                        "confirmations": None,
+                        "err": {"InstructionError": [3, {"Custom": 6001}]} if self.send_count == 2 else None,
+                        "confirmationStatus": "confirmed",
+                    }
+                    payload = {"jsonrpc": "2.0", "id": 1, "result": sig}
+                elif method == "getSignatureStatuses":
+                    sig = json["params"][0][0]
+                    payload = {"jsonrpc": "2.0", "id": 1, "result": {"value": [self.status_for_signature[sig]]}}
+                else:
+                    return super().post(url, json=json, timeout=timeout, headers=headers)
+
+                class Response:
+                    def raise_for_status(self):
+                        return None
+
+                    def json(self_nonlocal):
+                        return payload
+
+                return Response()
+
+        rebuilt = []
+        iter_balances = iter([7, 107])
+        def rebuild(plan, leg_index, amount):
+            rebuilt.append((leg_index, amount))
+            return SimpleNamespace(transactions_base64=["BAIF" if len(rebuilt) == 1 else "BgcI"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wallet = create_devnet_wallet(Path(tmp) / "wallet.json")
+            executor = TradeExecutor(
+                rpc_url="https://example-rpc.invalid", session=RetrySession(),
+                confirm_timeout_seconds=0.1, poll_interval_seconds=0.0,
+                rebuild_leg=rebuild, balance_reader=lambda _mint: next(iter_balances), max_leg_retries=1,
+            )
+            plan = {
+                "venue": "raydium_to_jupiter", "public_key": wallet.public_key,
+                "transactions_base64": ["AQID"],
+                "metadata": {"deferred_leg_index": 1, "legs": [
+                    {"in_mint": "SOL", "out_mint": "USDC"},
+                    {"in_mint": "USDC", "out_mint": "SOL", "deferred": True},
+                ]},
+            }
+            with patch.object(TradeExecutor, "_load_solders", return_value=(FakeKeypair, FakeVersionedTransaction)):
+                result = executor.execute_prepared_swaps(wallet, [plan])
+
+        plan_result = result["execution_results"][0]
+        self.assertTrue(plan_result["ok"])
+        self.assertTrue(result["execution_summary"]["completed"])
+        self.assertEqual(rebuilt, [(1, 100), (1, 100)])
+        failed, succeeded = plan_result["transactions"][-2:]
+        self.assertTrue(failed["superseded_by_retry"])
+        self.assertFalse(failed["ambiguous_broadcast"])
+        self.assertIsNone(succeeded["err"])
+        self.assertEqual(succeeded["attempt"], 1)
+
     def test_deferred_plan_rejects_processed_commitment(self) -> None:
         import tempfile
         from pathlib import Path

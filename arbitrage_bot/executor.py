@@ -23,7 +23,11 @@ class RpcResponseError(ExecutorError):
 
 
 class TransactionConfirmationError(ExecutorError):
-    pass
+    """A confirmation failure, optionally with the definitive chain status."""
+
+    def __init__(self, message: str, *, status: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 @dataclass(slots=True)
@@ -296,6 +300,8 @@ class TradeExecutor:
         )
         if deferred_leg_index is not None and entry_confirmed:
             received_amount = 0
+            # Keep these defined for the outer structured-error path if balance
+            # reading or fresh-plan building fails before a send is attempted.
             local_signature: str | None = None
             rpc_signature: str | None = None
             try:
@@ -309,37 +315,83 @@ class TradeExecutor:
                 if not fresh_transactions:
                     raise ExecutorError("Fresh second-leg builder returned no transactions")
                 for transaction_base64 in fresh_transactions:
-                    index = len(tx_results)
-                    local_signature = None
-                    rpc_signature = None
-                    signed_transaction_base64, local_signature = self._sign_transaction_base64(wallet, transaction_base64)
-                    send_started = time.monotonic()
-                    rpc_signature = self.rpc_client.send_transaction(
-                        signed_transaction_base64,
-                        skip_preflight=self.skip_preflight,
-                        preflight_commitment=self.commitment,
-                        max_retries=self.max_retries,
-                    )
-                    send_latency_ms = round((time.monotonic() - send_started) * 1000, 3)
-                    confirm_started = time.monotonic()
-                    status = self._confirm_signature(rpc_signature)
-                    tx_results.append(
-                        {
-                            "transaction_index": index,
-                            "leg_index": deferred_leg_index,
-                            "attempt": 0,
-                            "local_signature": local_signature,
-                            "rpc_signature": rpc_signature,
-                            "send_latency_ms": send_latency_ms,
-                            "confirm_latency_ms": round((time.monotonic() - confirm_started) * 1000, 3),
-                            "slot": status.get("slot") if status else None,
-                            "confirmations": status.get("confirmations") if status else None,
-                            "confirmation_status": status.get("confirmationStatus") if status else None,
-                            "err": status.get("err") if status else None,
-                            "wallet_lamport_delta": self._wallet_delta_safe(rpc_signature, wallet.public_key),
-                            "actual_input_amount": received_amount,
-                        }
-                    )
+                    # A confirmed on-chain failure (for example Jupiter's 6001
+                    # slippage error) is not ambiguous: the signature proves it
+                    # cannot later fill. Requote and retry the exact balance delta
+                    # before declaring a partial round trip. Transport/time-out
+                    # failures remain fail-closed and never trigger a retry sell.
+                    tx_to_send = transaction_base64
+                    completed_second_leg = False
+                    for attempt in range(1 + self.max_leg_retries):
+                        local_signature: str | None = None
+                        rpc_signature: str | None = None
+                        try:
+                            signed_transaction_base64, local_signature = self._sign_transaction_base64(wallet, tx_to_send)
+                            send_started = time.monotonic()
+                            rpc_signature = self.rpc_client.send_transaction(
+                                signed_transaction_base64,
+                                skip_preflight=self.skip_preflight,
+                                preflight_commitment=self.commitment,
+                                max_retries=self.max_retries,
+                            )
+                            send_latency_ms = round((time.monotonic() - send_started) * 1000, 3)
+                            confirm_started = time.monotonic()
+                            status = self._confirm_signature(rpc_signature)
+                            tx_results.append(
+                                {
+                                    "transaction_index": len(tx_results), "leg_index": deferred_leg_index,
+                                    "attempt": attempt, "local_signature": local_signature,
+                                    "rpc_signature": rpc_signature, "send_latency_ms": send_latency_ms,
+                                    "confirm_latency_ms": round((time.monotonic() - confirm_started) * 1000, 3),
+                                    "slot": status.get("slot"), "confirmations": status.get("confirmations"),
+                                    "confirmation_status": status.get("confirmationStatus"), "err": None,
+                                    "wallet_lamport_delta": self._wallet_delta_safe(rpc_signature, wallet.public_key),
+                                    "actual_input_amount": received_amount,
+                                }
+                            )
+                            completed_second_leg = True
+                            break
+                        except Exception as exc:  # noqa: BLE001 - return a structured partial result
+                            status = getattr(exc, "status", None)
+                            definitively_failed = isinstance(status, dict) and status.get("err") is not None
+                            can_retry = definitively_failed and attempt < self.max_leg_retries
+                            tx_results.append(
+                                {
+                                    "transaction_index": len(tx_results), "leg_index": deferred_leg_index,
+                                    "attempt": attempt, "local_signature": local_signature,
+                                    "rpc_signature": rpc_signature, "send_latency_ms": None,
+                                    "confirm_latency_ms": None,
+                                    "slot": status.get("slot") if isinstance(status, dict) else None,
+                                    "confirmations": status.get("confirmations") if isinstance(status, dict) else None,
+                                    "confirmation_status": status.get("confirmationStatus") if isinstance(status, dict) else None,
+                                    "err": str(exc), "actual_input_amount": received_amount,
+                                    "ambiguous_broadcast": not definitively_failed and (
+                                        rpc_signature is not None or
+                                        (local_signature is not None and isinstance(exc, requests.RequestException))
+                                    ),
+                                    "superseded_by_retry": can_retry,
+                                }
+                            )
+                            if not can_retry:
+                                if tx_results[-1]["ambiguous_broadcast"]:
+                                    metadata["recovery_blocked_ambiguous_broadcast"] = True
+                                break
+                            try:
+                                retry_plan = self.rebuild_leg(plan, deferred_leg_index, received_amount)  # type: ignore[misc]
+                                retry_transactions = list(getattr(retry_plan, "transactions_base64", None) or [])
+                                if not retry_transactions:
+                                    raise ExecutorError("Fresh second-leg retry builder returned no transactions")
+                                tx_to_send = retry_transactions[0]
+                            except Exception as rebuild_exc:  # noqa: BLE001
+                                tx_results[-1]["superseded_by_retry"] = False
+                                tx_results.append({
+                                    "transaction_index": len(tx_results), "leg_index": deferred_leg_index,
+                                    "attempt": attempt + 1, "err": f"second_leg_retry_build_failed: {rebuild_exc}",
+                                    "actual_input_amount": received_amount, "ambiguous_broadcast": False,
+                                })
+                                break
+                    if not completed_second_leg:
+                        break
             except Exception as exc:  # noqa: BLE001 - preserve partial state
                 # A returned RPC signature means the transaction may still land.
                 # Never launch an automatic recovery sell in that ambiguous state.
@@ -377,7 +429,9 @@ class TradeExecutor:
             and tx.get("err") is None
             for tx in tx_results
         )
-        all_recorded_ok = bool(tx_results) and all(tx.get("err") is None for tx in tx_results)
+        all_recorded_ok = bool(tx_results) and all(
+            tx.get("err") is None or tx.get("superseded_by_retry") for tx in tx_results
+        )
         plan_ok = entry_confirmed and deferred_confirmed and all_recorded_ok
         return {
             "venue": plan.get("venue", "unknown"),
@@ -402,7 +456,9 @@ class TradeExecutor:
             status = self.rpc_client.get_signature_status(signature)
             if status is not None:
                 if status.get("err") is not None:
-                    raise TransactionConfirmationError(f"Transaction {signature} failed: {status['err']}")
+                    raise TransactionConfirmationError(
+                        f"Transaction {signature} failed: {status['err']}", status=status
+                    )
                 confirmation_status = status.get("confirmationStatus")
                 if self._commitment_satisfied(confirmation_status):
                     return status
