@@ -267,6 +267,35 @@ class PrepareArbitrageTest(unittest.TestCase):
             self.assertEqual(state["halt_reason"], "incomplete_round_trip")
             self.assertEqual(state["daily_loss_lamports"], 5000)
 
+    def test_preflight_rejection_without_rpc_signature_does_not_halt(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = make_args(risk_state_path=str(Path(tmp) / "risk.json"))
+            path, state = _risk_state(args)
+            rejected_before_broadcast = {
+                "execution_summary": {"completed": False},
+                "execution_results": [
+                    {
+                        "metadata": {},
+                        "transactions": [
+                            {
+                                "err": "RPC sendTransaction failed: Transaction simulation failed",
+                                "rpc_signature": None,
+                                "confirmation_status": None,
+                                "ambiguous_broadcast": False,
+                                "wallet_lamport_delta": None,
+                            }
+                        ],
+                    }
+                ],
+            }
+            state = _update_risk_state(args, rejected_before_broadcast, path, state)
+            self.assertFalse(state["halted"])
+            self.assertIsNone(state["halt_reason"])
+            self.assertFalse(path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

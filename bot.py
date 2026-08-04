@@ -570,7 +570,16 @@ def _update_risk_state(args: argparse.Namespace, exec_out: dict, path: Path, sta
     ambiguous = any(tx.get("ambiguous_broadcast") for tx in all_transactions) or any(
         (result.get("metadata") or {}).get("recovery_blocked_ambiguous_broadcast") for result in results
     )
-    if results and (ambiguous or not summary.get("completed")):
+    # A preflight/simulation rejection is not a partial round trip: no transaction
+    # reached the chain when every RPC signature is absent and nothing confirmed.
+    # Do not poison the persistent circuit breaker in that case.  Conversely, a
+    # confirmed leg or an ambiguous send result is real on-chain exposure and must
+    # halt immediately until it is reconciled.
+    confirmed_or_submitted = any(
+        tx.get("confirmation_status") in {"confirmed", "finalized"} or tx.get("rpc_signature")
+        for tx in all_transactions
+    )
+    if results and (ambiguous or (not summary.get("completed") and confirmed_or_submitted)):
         known_negative = sum(
             abs(int(tx["wallet_lamport_delta"]))
             for tx in all_transactions
